@@ -1,0 +1,242 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+ROOT="$HOME/environments/tyty-droid"
+PLUG="$ROOT/plugins.d"
+DOCS="$ROOT/docs"
+
+usage(){
+cat <<USG
+ty — Tyty meta-shell (plugins, rewrites, profiles, tunnels, collectors)
+
+Core:
+  ty help
+  ty help adb
+  ty help cmds
+  ty status
+  ty doctor
+  ty who
+  ty shortcuts         (visual picker for aliases/functions/scripts/widgets)
+  ty menu              (same as ty shortcuts)
+  ty code [open|git|search|readme|shell]
+  ty web [status|core|ui|files]
+
+Apps & Debloat:
+  ty apps              (interactive app list)
+  ty debloat           (safe/advanced debloater)
+  ty install <file>    (advanced splits/bundles installer)
+  ty install --grant   (install + auto-grant perms)
+  ty apk <cmd> [args]  (APK analysis/staging toolkit)
+
+Rewrites:
+  ty adb pm <args>
+  ty adb cmd <svc> ...
+  ty adb <any>         (standard adb wrapper)
+
+Tunnels:
+  ty tunnel add reverse 3000 [REMOTE]
+  ty tunnel add forward 9222 [REMOTE]
+  ty tunnel list | ty tunnel clear
+
+Collectors:
+  ty collect logs | bug | props | packages
+
+Profiles:
+  ty profile set <name>
+  ty profile show
+USG
+}
+
+live_help(){
+  local f="$DOCS/adb-help.txt"
+  if [ -s "$f" ]; then
+    ${PAGER:-less} "$f"
+  else
+    adb --help | ${PAGER:-less}
+  fi
+}
+live_cmds(){
+  local a="$DOCS/adb-shell-cmd-list.txt"
+  local p="$DOCS/adb-shell-cmd-package-help.txt"
+  [ -s "$a" ] && echo "=== cmd -l ===" && cat "$a" || true
+  [ -s "$p" ] && echo -e "\n=== cmd package help ===" && cat "$p" || true
+}
+
+doctor(){
+  echo "== TYDROID DEEP DOCTOR =="
+  echo -e "\n[1] Environment & Path"
+  echo "  • which adb: $(command -v adb || echo '<none>')"
+  echo "  • PATH priority: $(echo "$PATH" | tr ':' '\n' | head -n 3 | tr '\n' ' ')"
+  
+  echo -e "\n[2] Hijack Check (Aliases/Functions)"
+  ( alias adb 2>/dev/null || true ) | sed 's/^/  • /'
+  ( typeset -f adb >/dev/null && echo "  • WARNING: 'adb' function detected!" || echo "  • No adb functions found." )
+
+  echo -e "\n[3] Service Status"
+  if curl -fs http://127.0.0.1:1313/health >/dev/null 2>&1; then echo "  • Tydroid Core (1313): OK"; else echo "  • Tydroid Core (1313): DOWN"; fi
+  if curl -fs http://127.0.0.1:1312/ >/dev/null 2>&1; then echo "  • Tydroid UI (1312): OK"; else echo "  • Tydroid UI (1312): DOWN"; fi
+  pgrep -f "adb.*server" >/dev/null && echo "  • ADB Server: RUNNING" || echo "  • ADB Server: STOPPED"
+  (ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null || true) | grep -q ':5037\b' && echo "  • Port 5037: OCCUPIED" || echo "  • Port 5037: FREE"
+
+  echo -e "\n[4] Device Connectivity"
+  adb devices -l | grep -v "List of" | sed 's/^/  /'
+  
+  echo -e "\n[5] Wireless Handshake (mDNS)"
+  timeout 2 adb mdns services 2>/dev/null | head -n 3 | sed 's/^/  • /' || echo "  • mDNS scan failed/timeout"
+
+  echo -e "\n[6] Keys & Security"
+  echo "  • Vendor Keys: ${ADB_VENDOR_KEYS:-~/.android}"
+  [ -d "${ADB_VENDOR_KEYS:-$HOME/.android}" ] && ls -1 "${ADB_VENDOR_KEYS:-$HOME/.android}" | head -n 3 | sed 's/^/    • /'
+}
+
+status_cockpit(){
+  local core ui adb_server adb_device default_host workspace storage_bridge battery wlan_ip
+
+  if curl -fs http://127.0.0.1:1313/health >/dev/null 2>&1; then core="OK"; else core="DOWN"; fi
+  if curl -fs http://127.0.0.1:1312/ >/dev/null 2>&1; then ui="OK"; else ui="DOWN"; fi
+  if pgrep -f "adb.*server" >/dev/null 2>&1; then adb_server="RUNNING"; else adb_server="STOPPED"; fi
+
+  adb_device="$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}' || true)"
+  [ -n "$adb_device" ] || adb_device="missing"
+
+  default_host="unset"
+  if [ -f "$HOME/tyadb.env" ]; then
+    default_host="$(. "$HOME/tyadb.env" >/dev/null 2>&1; printf '%s' "${TYADB_DEFAULT_HOST:-unset}")"
+  fi
+
+  workspace="$ROOT"
+  storage_bridge="${TYSHARED:-/sdcard/termux-shared}"
+
+  battery="unavailable"
+  if command -v termux-battery-status >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    battery="$(termux-battery-status 2>/dev/null | jq -r '"\(.percentage)% \(.status)"' 2>/dev/null || echo unavailable)"
+  fi
+
+  wlan_ip="$(ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2; exit}' || true)"
+  [ -n "$wlan_ip" ] || wlan_ip="unknown"
+
+  cat <<EOF
+== TYDROID COCKPIT ==
+Tydroid Core:     $core
+Tydroid UI:       $ui
+ADB Server:       $adb_server
+Device:           $adb_device
+Default Host:     $default_host
+Workspace:        $workspace
+Storage Bridge:   $storage_bridge
+Battery:          $battery
+Network:          $wlan_ip
+EOF
+}
+
+# ---- Safety Interlock (AI Instructions)
+check_safety(){
+  local cmd_line="$*"
+  # High-risk patterns from instructions
+  if [[ "$cmd_line" =~ (reboot|kill-all|pm\ clear|pm\ disable|rm\ -r|install\ -g) ]]; then
+    echo -e "\n\033[1;33m⚠️  HIGH RISK COMMAND DETECTED\033[0m"
+    echo "Command: $cmd_line"
+    echo "Risk: HIGH (Requires explicit confirmation)"
+    printf "Proceed? [y/N]: "
+    read -r resp
+    if [[ ! "$resp" =~ ^[yY]$ ]]; then
+      echo "Aborted."
+      exit 1
+    fi
+  fi
+}
+
+PROFILE_DIR="$ROOT/profiles"
+profile_set(){
+  local name="${1:-}"; [ -n "$name" ] || { echo "usage: ty profile set <name>"; exit 1; }
+  local sn; sn=$(adb get-serialno 2>/dev/null || echo "")
+  [ -n "$sn" ] || { echo "no device serial available"; exit 1; }
+  echo "ANDROID_SERIAL=$sn" > "$PROFILE_DIR/$name.env"
+  echo "profile '$name' bound to $sn"
+}
+profile_show(){ ls -1 "$PROFILE_DIR" 2>/dev/null | sed 's/^/  • /' || echo "no profiles"; }
+
+run_plugins(){
+  local handled=255
+  for p in "$PLUG"/*.sh; do
+    [ -f "$p" ] || continue
+    # shellcheck source=/dev/null
+    source "$p"
+    if ty_plugin "$@"; then return 0; fi
+  done
+  return $handled
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  help)
+    sub="${1:-}"
+    case "$sub" in
+      "") usage ;;
+      adb) live_help ;;
+      cmds) live_cmds ;;
+      *) usage ;;
+    esac
+    ;;
+  apps)
+    # Fetch from local server, fallback to adb
+    if curl -fs http://127.0.0.1:1313/health >/dev/null; then
+      curl -s "http://127.0.0.1:1313/packages" | jq -r '.apps[] | "\(.package) [\(.tier)]"' | fzf --header "Package list (Server Cache)"
+    else
+      adb shell pm list packages | cut -d: -f2 | fzf --header "Package list (Direct ADB)"
+    fi
+    ;;
+  debloat)
+    DEBLOATER="${TYDROID_DEBLOATER:-$HOME/legacy_archive/tydebloat_plus2.sh}"
+    if [ -x "$DEBLOATER" ]; then
+      "$DEBLOATER" "$@"
+    else
+      echo "ty debloat: no debloater installed; set TYDROID_DEBLOATER to its path" >&2
+      exit 1
+    fi
+    ;;
+  install)
+    ty-install "$@"
+    ;;
+  apk)
+    ty-apk-tool "$@"
+    ;;
+  doctor) doctor ;;
+  status|health) status_cockpit ;;
+  who)    adb devices -l ;;
+  profile)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      set) profile_set "${1:-}" ;;
+      show) profile_show ;;
+      *) echo "usage: ty profile {set <name>|show}" ;;
+    esac
+    ;;
+  *)
+    if run_plugins "$cmd" "$@"; then
+      exit 0
+    fi
+    check_safety "$cmd" "$@"
+    
+    # Run command and capture output/exit
+    set +e
+    output=$( ( [ "$cmd" = "adb" ] && adb "$@" || adb shell "$cmd" "$@" ) 2>&1 )
+    exit_code=$?
+    set -e
+
+    echo "$output"
+
+    # ---- Brain: Intelligent Error Handling
+    if [ $exit_code -ne 0 ]; then
+      if [[ "$output" =~ "Permission denied" ]]; then
+        echo -e "\n\033[1;36m💡 TYDROID SUGGESTION:\033[0m This app might be protected. Try 'ty debloat' or check elevation docs."
+      elif [[ "$output" =~ "device not found" ]]; then
+        echo -e "\n\033[1;36m💡 TYDROID SUGGESTION:\033[0m ADB daemon might be down. Run 'tyadb-connect' or check USB debugging."
+      elif [[ "$output" =~ "INSTALL_FAILED_LOW_SDK_VERSION" ]]; then
+        echo -e "\n\033[1;36m💡 TYDROID SUGGESTION:\033[0m Use 'ty install' to automatically bypass SDK blocks on Android 14+."
+      fi
+    fi
+    exit $exit_code
+    ;;
+esac

@@ -11,9 +11,10 @@ Extract this archive in Termux, enter its directory, and run:
 sh install.sh
 ```
 
-The script installs dependencies with Termux `pkg`, copies commands to
-`~/bin`, creates tyadb's config/state directories, and adds `~/bin` to PATH
-when needed. Run `tyadb doctor` afterward.
+The script installs dependencies with Termux `pkg`, copies the TyADB command
+suite to `~/bin`, installs the associated TyDroid command layer to
+`~/tydroid/tyty/bin`, creates config/state directories, and adds `~/bin` to
+PATH when needed. Run `tyadb doctor` afterward.
 
 The tyadb files themselves are included in `files/`, so they do not depend on
 an external source repository. The package downloads require internet access.
@@ -52,6 +53,9 @@ Tasker integration is optional. Tasker: https://tasker.joaoapps.com/
 - `tyadb-boot`: Wi-Fi reconnection/bootstrap helper
 - `tyadb-control.py`: optional standard-library-only Python HTTP bridge
 - `tyadb-*`: compatibility shortcut commands
+- `files/tyty-bin/`: the `ty`, `ty-core`, `ty-install`, `tyty-adb-ctl`, bridge,
+  WebTerm, and related command targets used by the symlinks in `~/bin`
+- `config/`: portable `tyadb.env` and `tyty-adb.conf` templates
 - `README.md`, `SHA256SUMS`, and `install.sh`
 
 No ADB private keys, device IP addresses, serials, logs, or running PIDs are
@@ -71,5 +75,9 @@ After installing:
 export PATH="$HOME/bin:$PATH"
 tyadb doctor
 tyadb help
+tyty-adb-ctl status
 ```
 
+The installer never copies your old pairing state, serials, logs, or ADB
+private keys. Pair the secondary device normally through Android Wireless
+debugging.

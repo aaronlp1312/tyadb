@@ -1,0 +1,50 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# --- Configuration ---
+PORT=3000
+TARGET_DIR="${1:-.}"
+
+# --- Helpers ---
+have() { command -v "$1" >/dev/null 2>&1; }
+toast() { have termux-toast && termux-toast "$1" || echo "[toast] $1"; }
+
+[ -d "$TARGET_DIR" ] || { echo "Directory not found: $TARGET_DIR"; exit 1; }
+cd "$TARGET_DIR"
+
+# --- The Live Engine ---
+# This starts the server and watches for logs sent to /__log
+toast "Starting Dev Hub in $TARGET_DIR"
+
+browser-sync start --server --files "**/*" --port "$PORT" --no-notify --middleware '
+[
+  {
+    route: "/__log",
+    handle: function (req, res, next) {
+      if (req.method === "POST") {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+          const data = JSON.parse(body);
+          const color = data.type === "error" ? "\x1b[31m" : "\x1b[32m";
+          process.stdout.write(`\n${color}[BROWSER ${data.type.toUpperCase()}] ${data.logs.join(" ")}\x1b[0m\n`);
+          res.end("ok");
+        });
+      } else { next(); }
+    }
+  }
+]
+' &
+
+# --- The Lint-Gate (Revert Logic) ---
+# Watches for file modifications. If JS is broken, it stops the reload.
+while changed=$(inotifywait -e modify -r . --format '%w%f' 2>/dev/null); do
+  
+  if [[ "$changed" == *.js ]]; then
+    if ! node --check "$changed" >/dev/null 2>&1; then
+      echo -e "\x1b[33m[LINT] Syntax Error in $changed. Refresh Blocked (Reverted).\x1b[0m"
+      # We don't exit; we just skip the loop so browser-sync doesn't reload broken code
+      continue
+    fi
+  fi
+  echo -e "\x1b[34m[SYNC] $changed updated. Refreshing browser...\x1b[0m"
+done

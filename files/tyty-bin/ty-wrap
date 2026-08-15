@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+LOG="$HOME/environments/tyty-droid/logs/commands_$(date +%Y%m%d).log"
+mkdir -p "$(dirname "$LOG")"
+echo "[$(date '+%F %T')] $*" >> "$LOG"
+exec "$@"

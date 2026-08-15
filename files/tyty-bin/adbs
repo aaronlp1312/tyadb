@@ -1,0 +1,10 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+# Choose the first connected device. Pass a serial explicitly when more than
+# one device is connected: `adbs -s SERIAL COMMAND ...`.
+TARGET=$(adb devices | awk 'NR > 1 && $2 == "device" {print $1; exit}')
+if [ -z "$TARGET" ]; then
+  echo "No connected device found. Pair/connect it first with tyadb." >&2
+  exit 1
+fi
+exec adb -s "$TARGET" "$@"

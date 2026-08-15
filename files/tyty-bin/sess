@@ -1,0 +1,40 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# sess — Export session history within a time range to shared storage
+
+TARGET_DIR="/sdcard/termux-shared"
+# Try standard path if /sdcard isn't setup
+[ -d "$TARGET_DIR" ] || TARGET_DIR="$HOME/storage/shared/termux-shared"
+mkdir -p "$TARGET_DIR"
+
+# 1. Ask for time range via popup
+RESPONSE=$(termux-dialog radio -t "Export Session History" -v "1 Hour,4 Hours,12 Hours,24 Hours")
+CHOICE=$(echo "$RESPONSE" | jq -r '.text')
+
+case "$CHOICE" in
+    "1 Hour")   HOURS=1 ;;
+    "4 Hours")  HOURS=4 ;;
+    "12 Hours") HOURS=12 ;;
+    "24 Hours") HOURS=24 ;;
+    *) echo "Cancelled."; exit 0 ;;
+esac
+
+# Calculate UTC ISO timestamp
+THRESHOLD_EPOCH=$(($(date +%s) - HOURS*3600))
+THRESHOLD=$(date -d "@$THRESHOLD_EPOCH" -u +"%Y-%m-%dT%H:%M:%SZ")
+OUT_FILE="$TARGET_DIR/session_range_${HOURS}hr_$(date +%Y%m%d_%H%M).json"
+
+echo "⏳ Searching logs for activity after $THRESHOLD..."
+
+# 2. Collect and filter logs
+# Searches all .jsonl files in the tmp chat directories
+# Keeps user content and gemini responses
+find "$HOME/.gemini/tmp" -name "*.jsonl" -type f -print0 | xargs -0 jq -sc --arg ts "$THRESHOLD" \
+  'map(select(.timestamp != null and .timestamp >= $ts and (.type == "user" or .type == "gemini" or .content != null))) | flatten | .[]' > "$OUT_FILE"
+
+if [ -s "$OUT_FILE" ]; then
+    termux-toast "✅ Exported to $OUT_FILE"
+    echo "Done. Exported to: $OUT_FILE"
+else
+    echo "❌ No history found in that range."
+    rm -f "$OUT_FILE"
+fi

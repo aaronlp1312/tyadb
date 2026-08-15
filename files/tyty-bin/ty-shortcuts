@@ -1,0 +1,342 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+ROOT="${TYDROID_ROOT:-$HOME/environments/tyty-droid}"
+OUT_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tydroid"
+OUT="$OUT_DIR/shortcuts.tsv"
+
+mkdir -p "$OUT_DIR"
+
+clean_field(){
+  printf '%s' "${1:-}" | tr '\t\r\n' '   ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+emit(){
+  kind="$(clean_field "$1")"
+  name="$(clean_field "$2")"
+  command="$(clean_field "$3")"
+  source="$(clean_field "$4")"
+  detail="$(clean_field "${5:-}")"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$name" "$command" "$source" "$detail"
+}
+
+collect_aliases(){
+  for f in "$HOME/.zshrc" "$HOME/.zshrc.d"/*.zsh; do
+    [ -f "$f" ] || continue
+    awk -v src="$f" '
+      /^[[:space:]]*alias[[:space:]]+[A-Za-z0-9_.:-]+=/ {
+        line=$0
+        sub(/^[[:space:]]*alias[[:space:]]+/, "", line)
+        name=line
+        sub(/=.*/, "", name)
+        cmd=line
+        sub(/^[^=]+=/, "", cmd)
+        detail=""
+        if (cmd ~ /#[[:space:]]*/) {
+          detail=cmd
+          sub(/^.*#[[:space:]]*/, "", detail)
+        }
+        printf "alias\t%s\t%s\t%s:%d\t%s\n", name, cmd, src, NR, detail
+      }
+    ' "$f"
+  done
+}
+
+collect_functions(){
+  for f in "$HOME/.zshrc" "$HOME/.zshrc.d"/*.zsh; do
+    [ -f "$f" ] || continue
+    awk -v src="$f" '
+      /^[[:space:]]*function[[:space:]]+[A-Za-z_][A-Za-z0-9_-]*/ {
+        line=$0
+        sub(/^[[:space:]]*function[[:space:]]+/, "", line)
+        name=line
+        sub(/[[:space:](].*/, "", name)
+        printf "function\t%s\t%s\t%s:%d\t%s\n", name, name, src, NR, "shell function"
+      }
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*\(\)[[:space:]]*\{/ {
+        line=$0
+        sub(/^[[:space:]]*/, "", line)
+        name=line
+        sub(/\(\).*/, "", name)
+        printf "function\t%s\t%s\t%s:%d\t%s\n", name, name, src, NR, "shell function"
+      }
+    ' "$f"
+  done
+}
+
+collect_scripts(){
+  dir="$1"
+  kind="$2"
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null |
+    while IFS= read -r path; do
+      [ -x "$path" ] || continue
+      name="$(basename "$path")"
+      case "$path" in
+        "$HOME/bin/"*) cmd="$name" ;;
+        *) cmd="$path" ;;
+      esac
+      emit "$kind" "$name" "$cmd" "$path" "executable"
+    done
+}
+
+collect_plugins(){
+  [ -d "$ROOT/plugins.d" ] || return 0
+  for f in "$ROOT/plugins.d"/*.sh; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    case "$base" in
+      05-shortcuts.sh)
+        emit "plugin" "ty shortcuts" "ty shortcuts" "$f" "visual shortcut browser"
+        emit "plugin" "ty menu" "ty menu" "$f" "visual shortcut browser"
+        ;;
+      10-pm-rewrite.sh) emit "plugin" "ty adb pm" "ty adb pm <args>" "$f" "package manager rewrite" ;;
+      11-cmd-rewrite.sh) emit "plugin" "ty adb cmd" "ty adb cmd <service> ..." "$f" "cmd service rewrite" ;;
+      20-tunnels.sh)
+        emit "plugin" "ty tunnel list" "ty tunnel list" "$f" "show ADB forward/reverse tunnels"
+        emit "plugin" "ty tunnel clear" "ty tunnel clear" "$f" "clear ADB tunnels"
+        emit "plugin" "ty tunnel add" "ty tunnel add reverse 3000" "$f" "add reverse/forward tunnel"
+        ;;
+      30-collectors.sh)
+        emit "plugin" "ty collect logs" "ty collect logs" "$f" "capture recent logcat"
+        emit "plugin" "ty collect bug" "ty collect bug" "$f" "capture bugreport"
+        emit "plugin" "ty collect props" "ty collect props" "$f" "capture getprop"
+        emit "plugin" "ty collect packages" "ty collect packages" "$f" "capture package list"
+        ;;
+      40-ops.sh)
+        emit "plugin" "ty ops heal" "ty ops heal" "$f" "reconnect ADB"
+        emit "plugin" "ty ops wifi" "ty ops wifi" "$f" "set adbd tcpip 5555"
+        emit "plugin" "ty ops pair" "ty ops pair <ip> <port> <code>" "$f" "pair wireless ADB"
+        emit "plugin" "ty ops who" "ty ops who" "$f" "show devices"
+        ;;
+      50-lights.sh) emit "plugin" "ty lights" "ty lights <args>" "$f" "smart light helper" ;;
+      60-code.sh)
+        emit "plugin" "ty code" "ty code" "$f" "project picker"
+        emit "plugin" "ty code git" "ty code git" "$f" "project git UI"
+        emit "plugin" "ty code search" "ty code search <pattern>" "$f" "search project"
+        ;;
+      61-web.sh)
+        emit "plugin" "ty web status" "ty web status" "$f" "service dashboard"
+        emit "plugin" "ty web core start" "ty web core start" "$f" "start core API"
+        emit "plugin" "ty web ui start" "ty web ui start" "$f" "start UI"
+        emit "plugin" "ty web files start" "ty web files start" "$f" "start filebrowser"
+        ;;
+      *) emit "plugin" "${base%.sh}" "ty ${base%.sh}" "$f" "Tydroid plugin" ;;
+    esac
+  done
+}
+
+collect_named_tools(){
+  for name in logo crack warp boss peek host beam scrub ninja setlook setstyle setprompt ftext ty tyty tyadb tadb tybridge-start tybridge-status tybridge-stop tydroid-server; do
+    if command -v "$name" >/dev/null 2>&1; then
+      emit "tool" "$name" "$name" "$(command -v "$name")" "Worthiit/Tydroid command"
+    fi
+  done
+  emit "tool" "in-c" "warp in" "$HOME/.zshrc" "pull files into Termux"
+  emit "tool" "out-c" "warp out" "$HOME/.zshrc" "push files to Downloads"
+}
+
+build_index(){
+  {
+    collect_aliases
+    collect_functions
+    collect_scripts "$HOME/bin" "script"
+    collect_scripts "$HOME/.shortcuts" "widget"
+    collect_plugins
+    collect_named_tools
+  } | awk -F '\t' 'NF >= 4 && !seen[$1 FS $2 FS $3]++' > "$OUT"
+}
+
+list_index(){
+  build_index
+  want="${1:-}"
+  awk -F '\t' -v want="$want" '
+    want == "" || $1 == want { printf "%-9s %-28s %s\n", $1, $2, $3 }
+  ' "$OUT"
+}
+
+stats_index(){
+  build_index
+  awk -F '\t' '
+    { count[$1]++; total++ }
+    END {
+      printf "total     %d\n", total
+      for (k in count) printf "%-9s %d\n", k, count[k]
+    }
+  ' "$OUT" | sort
+}
+
+export_index(){
+  build_index
+  mode="${1:-runnable}"
+  format="${2:-tsv}"
+
+  case "$mode" in
+    all)
+      data="$(cat "$OUT")"
+      ;;
+    runnable|commands)
+      data="$(awk -F '\t' '$1 != "function" { print }' "$OUT")"
+      ;;
+    alias|function|script|widget|plugin|tool)
+      data="$(awk -F '\t' -v want="$mode" '$1 == want { print }' "$OUT")"
+      ;;
+    *)
+      echo "unknown export mode: $mode" >&2
+      echo "try: ty shortcuts export all|runnable|alias|function|script|widget|plugin|tool [tsv|plain|md]" >&2
+      return 2
+      ;;
+  esac
+
+  case "$format" in
+    tsv)
+      out="$data"
+      ;;
+    plain)
+      out="$(printf '%s\n' "$data" | awk -F '\t' '{ printf "%-9s %-28s %s\n", $1, $2, $3 }')"
+      ;;
+    md|markdown)
+      out="$(
+        {
+          echo "| Kind | Name | Command | Source | Detail |"
+          echo "|---|---|---|---|---|"
+          printf '%s\n' "$data" | awk -F '\t' '{
+            gsub(/\|/, "\\|", $2); gsub(/\|/, "\\|", $3); gsub(/\|/, "\\|", $4); gsub(/\|/, "\\|", $5)
+            printf "| `%s` | `%s` | `%s` | `%s` | %s |\n", $1, $2, $3, $4, $5
+          }'
+        }
+      )"
+      ;;
+    *)
+      echo "unknown export format: $format" >&2
+      echo "try: tsv, plain, or md" >&2
+      return 2
+      ;;
+  esac
+
+  printf '%s\n' "$out"
+}
+
+clip_index(){
+  mode="${1:-runnable}"
+  format="${2:-tsv}"
+  command -v termux-clipboard-set >/dev/null 2>&1 || { echo "termux-clipboard-set not found"; return 127; }
+  tmp="$(mktemp)"
+  export_index "$mode" "$format" > "$tmp"
+  termux-clipboard-set < "$tmp"
+  rows="$(awk 'END{print NR}' "$tmp")"
+  rm -f "$tmp"
+  echo "[ty-shortcuts] copied $rows rows to clipboard ($mode, $format)"
+}
+
+preview_item(){
+  line="$1"
+  IFS=$'\t' read -r kind name command source detail <<EOF
+$line
+EOF
+  {
+    printf 'kind:    %s\n' "$kind"
+    printf 'name:    %s\n' "$name"
+    printf 'command: %s\n' "$command"
+    printf 'source:  %s\n' "$source"
+    [ -n "${detail:-}" ] && printf 'detail:  %s\n' "$detail"
+    printf '\n'
+    path="${source%%:*}"
+    lineno="${source##*:}"
+    if [ -f "$path" ] && [ "$lineno" != "$source" ] && printf '%s' "$lineno" | grep -Eq '^[0-9]+$'; then
+      start=$((lineno - 4)); [ "$start" -lt 1 ] && start=1
+      end=$((lineno + 8))
+      sed -n "${start},${end}p" "$path"
+    elif [ -f "$path" ]; then
+      sed -n '1,80p' "$path"
+    fi
+  }
+}
+
+pick_item(){
+  build_index
+  [ -s "$OUT" ] || { echo "no shortcuts found"; return 1; }
+
+  if ! command -v fzf >/dev/null 2>&1; then
+    list_index
+    return 0
+  fi
+
+  selection="$(
+    awk -F '\t' '{ printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5 }' "$OUT" |
+      fzf --with-nth=1,2,3,5 \
+          --delimiter=$'\t' \
+          --prompt="Tydroid shortcuts > " \
+          --height=80% \
+          --layout=reverse \
+          --preview='
+            IFS=$'\''\t'\'' read -r kind name command source detail <<< {}
+            path="${source%%:*}"
+            line="${source##*:}"
+            printf "kind:    %s\nname:    %s\ncommand: %s\nsource:  %s\ndetail:  %s\n\n" "$kind" "$name" "$command" "$source" "$detail"
+            if [ -f "$path" ] && printf "%s" "$line" | grep -Eq "^[0-9]+$"; then
+              start=$((line - 4)); [ "$start" -lt 1 ] && start=1
+              end=$((line + 8))
+              sed -n "${start},${end}p" "$path"
+            elif [ -f "$path" ]; then
+              sed -n "1,80p" "$path"
+            fi
+          '
+  )" || return 1
+
+  IFS=$'\t' read -r kind name command source detail <<EOF
+$selection
+EOF
+
+  printf '%s\n' "$command"
+  if command -v termux-clipboard-set >/dev/null 2>&1; then
+    printf '%s' "$command" | termux-clipboard-set
+    echo "[ty-shortcuts] copied command to clipboard"
+  fi
+}
+
+show_help(){
+  cat <<'USG'
+usage: ty-shortcuts [command]
+
+commands:
+  pick      Open visual picker and copy selected command
+  list      Print all discovered shortcuts
+  list KIND Print one kind: alias, function, script, widget, plugin, tool
+  stats     Count discovered shortcuts by kind
+  export    Print export data: export [MODE] [FORMAT]
+  clip      Copy export data to Android clipboard: clip [MODE] [FORMAT]
+  rebuild   Rebuild cache only
+  path      Print cache path
+  help      Show this help
+
+Modes:
+  all, runnable, alias, function, script, widget, plugin, tool
+
+Formats:
+  tsv, plain, md
+
+Sources:
+  ~/.zshrc and ~/.zshrc.d/*.zsh aliases/functions
+  ~/bin executable scripts
+  ~/.shortcuts Termux Widget scripts
+  ~/environments/tyty-droid/plugins.d plugins
+  Worthiit/Tydroid named tools such as logo, crack, warp, boss
+USG
+}
+
+case "${1:-pick}" in
+  pick|menu|fzf) pick_item ;;
+  list) list_index "${2:-}" ;;
+  stats) stats_index ;;
+  export) export_index "${2:-runnable}" "${3:-tsv}" ;;
+  clip|copy|clipboard) clip_index "${2:-runnable}" "${3:-tsv}" ;;
+  rebuild) build_index; echo "$OUT" ;;
+  path) echo "$OUT" ;;
+  help|-h|--help) show_help ;;
+  preview)
+    shift || true
+    preview_item "$*"
+    ;;
+  *) show_help; exit 2 ;;
+esac

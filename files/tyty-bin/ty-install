@@ -1,0 +1,93 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ty-install — Advanced ADB Installer (Splits, bundles, and auto-perms)
+set -Eeuo pipefail
+. "$HOME/tyadb.env"
+
+GRANT=0
+BYPASS=""
+SERIAL=""
+
+usage() {
+    echo "usage: ty-install [-s serial] [--grant] <file.apk|folder|file.apks>"
+    exit 1
+}
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s) SERIAL="-s $2"; shift 2 ;;
+        --grant) GRANT=1; shift ;;
+        -*) usage ;;
+        *) break ;;
+    esac
+done
+
+[ $# -ge 1 ] || usage
+TARGET="$1"
+
+# 1. API Level Check (for bypass flag)
+API_LEVEL=$(__tyrun $SERIAL shell getprop ro.build.version.sdk | tr -d '\r')
+if [ "$API_LEVEL" -ge 34 ]; then
+    BYPASS="--bypass-low-target-sdk-block"
+fi
+
+install_single() {
+    local f="$1"
+    local sz=$(stat -c %s "$f")
+    echo "→ Installing $f ($sz bytes)..."
+    cat "$f" | __tyrun $SERIAL shell "pm install $BYPASS -S $sz"
+}
+
+install_splits() {
+    local files=("$@")
+    local total_sz=0
+    for f in "${files[@]}"; do total_sz=$((total_sz + $(stat -c %s "$f"))); done
+    
+    echo "→ Creating install session (total $total_sz bytes)..."
+    local session_id=$(__tyrun $SERIAL shell "pm install-create $BYPASS -S $total_sz" | grep -oE '[0-9]+')
+    
+    for i in "${!files[@]}"; do
+        local f="${files[$i]}"
+        local sz=$(stat -c %s "$f")
+        echo "  [$(($i+1))/${#files[@]}] Writing $f..."
+        cat "$f" | __tyrun $SERIAL shell "pm install-write -S $sz $session_id $i -"
+    done
+    
+    echo "→ Committing session $session_id..."
+    __tyrun $SERIAL shell "pm install-commit $session_id"
+}
+
+# 2. Identify Target Type
+if [ -d "$TARGET" ]; then
+    # Directory of APKs
+    files=("$TARGET"/*.apk)
+    install_splits "${files[@]}"
+elif [[ "$TARGET" == *.apks ]]; then
+    # ZIP bundle
+    TMP_DIR=$(mktemp -d)
+    unzip -q "$TARGET" -d "$TMP_DIR"
+    files=("$TMP_DIR"/*.apk)
+    install_splits "${files[@]}"
+    rm -rf "$TMP_DIR"
+elif [ -f "$TARGET" ]; then
+    install_single "$TARGET"
+else
+    echo "Error: $TARGET not found."
+    exit 1
+fi
+
+# 3. Optional Auto-Grant
+if [ $GRANT -eq 1 ]; then
+    # Guess package name from the first APK (requires aapt2 if available, or just skip if not)
+    if command -v aapt2 >/dev/null; then
+        pkg=$(aapt2 dump packagename "$TARGET" 2>/dev/null || true)
+        if [ -n "$pkg" ]; then
+            echo "→ Auto-granting permissions for $pkg..."
+            __tyrun $SERIAL shell "pm grant $pkg android.permission.READ_EXTERNAL_STORAGE" 2>/dev/null || true
+            __tyrun $SERIAL shell "pm grant $pkg android.permission.WRITE_EXTERNAL_STORAGE" 2>/dev/null || true
+            __tyrun $SERIAL shell "pm grant $pkg android.permission.ACCESS_FINE_LOCATION" 2>/dev/null || true
+        fi
+    fi
+fi
+
+echo "Done."

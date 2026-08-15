@@ -1,0 +1,337 @@
+#!/data/data/com.termux/files/usr/bin/python
+import base64, json, subprocess, threading, time, re, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+# ---- Configuration
+API_PORT = 1313
+API_PORT_RANGE = (1313, 1320)
+UI_PORT = 1312
+WWW_DIR = os.path.expanduser("~/environments/tyty-droid/www")
+DELIM = "___TYADB_EOF___"
+
+# ---- State
+LOCK = threading.RLock()
+SESS = {}  # key -> {"p": Popen, "lock": threading.RLock(), "ts": last_used}
+PKG_CACHE = {} # serial -> {"data": [], "ts": timestamp}
+
+def _now(): return time.time()
+
+def _adb_cmd(key, args, timeout=30):
+    cmd = ["adb"]
+    if key:
+        cmd += ["-s", key]
+    cmd += list(args)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=timeout)
+        return res.returncode, (res.stdout or "") + (res.stderr or "")
+    except FileNotFoundError:
+        return 127, "[tyadb] adb not found in PATH"
+    except subprocess.TimeoutExpired:
+        return 124, "[tyadb] command timeout"
+
+def _connected_devices():
+    code, out = _adb_cmd("", ["devices", "-l"], timeout=10)
+    devices = []
+    for line in out.splitlines()[1:]:
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        meta = {}
+        for item in parts[2:]:
+            if ":" in item:
+                k, v = item.split(":", 1)
+                meta[k] = v
+        devices.append({"serial": parts[0], "state": parts[1], "meta": meta})
+    return {"exit": code, "devices": devices, "raw": out}
+
+def _resolve_serial(serial):
+    if serial:
+        return serial, None
+    devices = [d for d in _connected_devices()["devices"] if d["state"] == "device"]
+    if len(devices) == 1:
+        return devices[0]["serial"], None
+    if len(devices) > 1:
+        return "", "multiple devices connected; pass serial"
+    return "", "no connected device"
+
+def _shell_once(serial, command, timeout=30):
+    key, warning = _resolve_serial(serial)
+    if warning and not key:
+        return 2, f"[tyadb] {warning}"
+    return _adb_cmd(key, ["shell", command], timeout=timeout)
+
+# ---- ADB Shell Management
+def _start_shell(key):
+    with LOCK:
+        if key in SESS and SESS[key]["p"].poll() is None:
+            return SESS[key]
+        cmd = ["adb"]
+        if key: cmd += ["-s", key]
+        cmd += ["shell", "-t"]
+        p = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+        SESS[key] = {"p": p, "lock": threading.RLock(), "ts": _now()}
+        return SESS[key]
+
+def _stop_shell(key):
+    with LOCK:
+        s = SESS.get(key)
+        if not s: return False
+        try:
+            if s["p"].poll() is None:
+                try:
+                    s["p"].stdin.write("exit\n")
+                    s["p"].stdin.flush()
+                except: pass
+                s["p"].terminate()
+        finally:
+            try: s["p"].kill()
+            except: pass
+            if key in SESS: del SESS[key]
+        return True
+
+def _exec_in_shell(key, command, timeout=30):
+    s = _start_shell(key)
+    marker = f"{DELIM}:{time.time_ns()}"
+    wrapped = f"{command}\necho {marker}:$?\n"
+    out = []
+    code = 127
+    with s["lock"]:
+        s["ts"] = _now()
+        try:
+            s["p"].stdin.write(wrapped)
+            s["p"].stdin.flush()
+        except Exception as e:
+            return 127, f"[tyadb] failed to write: {e}"
+        start = _now()
+        while True:
+            if (_now() - start) > timeout: return 124, "[tyadb] timeout"
+            line = s["p"].stdout.readline()
+            if not line: return 127, "[tyadb] shell died"
+            line = line.rstrip("\r\n")
+            if line.startswith(marker + ":"):
+                try: code = int(line.split(":",2)[-1])
+                except: code = 1
+                break
+            out.append(line)
+    return code, "\n".join(out)
+
+# ---- Package Management
+def _parse_dumpsys(text):
+    blocks = re.split(r"\n\s*Package \[", text)[1:]
+    apps = []
+    for block in blocks:
+        if "]" not in block: continue
+        pkg_name = block.split("]", 1)[0].strip()
+        info = {
+            "package": pkg_name, 
+            "version": {}, 
+            "installer": None, 
+            "path": None, 
+            "group": "USER", 
+            "tier": "safe",
+            "label": None,
+            "status": "enabled"
+        }
+        
+        # label guessing
+        lbl_match = re.search(r"nonLocalizedLabel=(.*)", block)
+        if lbl_match:
+            val = lbl_match.group(1).strip()
+            if val != "null": info["label"] = val
+        
+        if not info["label"]:
+            parts = pkg_name.split(".")
+            suffix = parts[-1] if len(parts) > 1 else pkg_name
+            info["label"] = suffix.replace("_", " ").title()
+
+        # status check
+        if "enabled=1" in block or "enabled=true" in block: info["status"] = "enabled"
+        elif any(x in block for x in ["enabled=2", "enabled=false", "disabled=true"]): info["status"] = "disabled"
+
+        # metadata
+        vname = re.search(r"versionName=(.*)", block)
+        vcode = re.search(r"versionCode=(.*)", block)
+        path = re.search(r"codePath=(.*)", block)
+        inst = re.search(r"installerPackageName=(.*)", block)
+        flags = re.search(r"flags=\[(.*)\]", block)
+        
+        if vname: info["version"]["name"] = vname.group(1).strip()
+        if vcode: info["version"]["code"] = vcode.group(1).split()[0]
+        if path: info["path"] = path.group(1).strip()
+        if inst:
+            val = inst.group(1).strip()
+            info["installer"] = None if val == "null" else val
+        
+        # Classification
+        f_str = flags.group(1) if flags else ""
+        p = info["path"] or ""
+        is_priv = "/priv-app/" in p or "CORE" in f_str
+        is_sys = any(x in p for x in ["/system/", "/product/", "/vendor/", "/system_ext/"]) or "SYSTEM" in f_str
+        
+        if is_priv: info["group"], info["tier"] = "PRIV", "unsafe"
+        elif is_sys: info["group"], info["tier"] = "SYSTEM", "advanced"
+        else:
+            if info["installer"] and re.search(r"(vending|google.android.packageinstaller|samsungapps|galaxyapps|com\.amazon\.venezia)", info["installer"]):
+                info["group"] = "USER" if "/data/app/" in p else "PRELOAD"
+                info["tier"] = "safe"
+            else:
+                info["group"] = "PRELOAD"
+                info["tier"] = "safe"
+        apps.append(info)
+    return apps
+
+def _get_packages(key, force=False):
+    now = _now()
+    if not force and key in PKG_CACHE and (now - PKG_CACHE[key]["ts"]) < 300:
+        return PKG_CACHE[key]["data"]
+    
+    cmd = ["adb"]
+    if key: cmd += ["-s", key]
+    cmd += ["shell", "dumpsys package packages"]
+    res = subprocess.run(cmd, capture_output=True, text=True, errors="ignore")
+    if res.returncode != 0: return []
+    
+    apps = _parse_dumpsys(res.stdout)
+    PKG_CACHE[key] = {"data": apps, "ts": now}
+    return apps
+
+def _device_summary(serial=""):
+    key, warning = _resolve_serial(serial)
+    devices = _connected_devices()
+    if not key:
+        return {"serial": "", "warning": warning, "devices": devices["devices"]}
+    props = {}
+    for name in ["ro.product.model", "ro.product.manufacturer", "ro.build.version.release", "ro.build.version.sdk"]:
+        code, out = _adb_cmd(key, ["shell", "getprop", name], timeout=8)
+        props[name] = out.strip() if code == 0 else ""
+    return {
+        "serial": key,
+        "state": "device",
+        "devices": devices["devices"],
+        "model": props.get("ro.product.model", ""),
+        "manufacturer": props.get("ro.product.manufacturer", ""),
+        "android": props.get("ro.build.version.release", ""),
+        "sdk": props.get("ro.build.version.sdk", ""),
+        "warning": warning,
+    }
+
+# ---- Unified Handler
+class TydroidHandler(BaseHTTPRequestHandler):
+    def _ok(self, body=b"ok", ct="text/plain"):
+        self.send_response(200)
+        self.send_header("Content-Type", ct)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj): self._ok(json.dumps(obj).encode(), "application/json")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        # API Routes
+        if p.path == "/":
+            self._json({
+                "ok": True,
+                "name": "tyadb-python-bridge",
+                "mode": "broker-prototype",
+                "endpoints": [
+                    "/health", "/sessions", "/devices", "/open", "/exec", "/close",
+                    "/broker/capabilities", "/broker/device", "/broker/packages"
+                ]
+            })
+        elif p.path == "/health": self._ok(b"ok")
+        elif p.path == "/sessions":
+            with LOCK:
+                payload = {"sessions":[{"key":k, "alive": (v["p"].poll() is None), "last": v["ts"]} for k,v in SESS.items()]}
+            self._json(payload)
+        elif p.path == "/devices":
+            self._json(_connected_devices())
+        elif p.path == "/packages":
+            qs = parse_qs(p.query)
+            serial = qs.get("serial", [""])[0]
+            force = "force" in qs
+            self._json({"apps": _get_packages(serial, force)})
+        elif p.path == "/broker/capabilities":
+            self._json({
+                "ok": True,
+                "name": "TyDroid Broker Prototype",
+                "backend": "stock-adb",
+                "services": {
+                    "terminal": ["exec", "open", "close"],
+                    "device": ["summary", "devices"],
+                    "packages": ["list"],
+                    "intents": ["catalog planned in tyadb-control.py"],
+                    "settings": ["list planned in tyadb-control.py"]
+                }
+            })
+        elif p.path == "/broker/device":
+            qs = parse_qs(p.query)
+            self._json(_device_summary(qs.get("serial", [""])[0]))
+        elif p.path == "/broker/packages":
+            qs = parse_qs(p.query)
+            serial = qs.get("serial", [""])[0]
+            force = "force" in qs
+            apps = _get_packages(serial, force)
+            self._json({"serial": serial, "count": len(apps), "apps": apps})
+        elif p.path == "/env":
+            self._json({"brand": "Tydroid", "model": "SM-S937U", "os": "Android 16", "root": False})
+        
+        # Static File Routes (UI)
+        else:
+            rel = p.path.lstrip("/") or "index.html"
+            fpath = os.path.join(WWW_DIR, rel)
+            if os.path.exists(fpath) and os.path.isfile(fpath):
+                ct = "text/html" if fpath.endswith(".html") else "text/css" if fpath.endswith(".css") else "application/javascript" if fpath.endswith(".js") else "application/octet-stream"
+                with open(fpath, "rb") as f: self._ok(f.read(), ct)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length","0") or 0)
+        req = json.loads(self.rfile.read(ln).decode() or "{}") if ln else {}
+        p = urlparse(self.path)
+        serial = str(req.get("serial","") or "")
+
+        if p.path == "/exec" or p.path == "/sendCommand" or p.path == "/command" or p.path == "/broker/terminal":
+            cmd, to = str(req.get("cmd", req.get("command",""))), int(req.get("timeout",30))
+            code, out = _exec_in_shell(serial, cmd, timeout=to)
+            self._json({"exit":code, "out_b64": base64.b64encode(out.encode()).decode(), "result": base64.b64encode(out.encode()).decode()})
+        elif p.path == "/open":
+            _start_shell(serial)
+            self._json({"ok":True, "serial":serial})
+        elif p.path == "/close":
+            self._json({"ok": _stop_shell(serial), "serial": serial})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def main():
+    srv = None
+    port = None
+    for p in [API_PORT] + [x for x in range(API_PORT_RANGE[0], API_PORT_RANGE[1] + 1) if x != API_PORT]:
+        try:
+            srv = HTTPServer(("127.0.0.1", p), TydroidHandler)
+            port = p; break
+        except OSError: continue
+    if srv is None:
+        print("[ty-core] no free port 1313..1320")
+        return
+    print(f"[ty-core] listening on http://127.0.0.1:{port}")
+    try: srv.serve_forever()
+    except KeyboardInterrupt: pass
+
+if __name__ == "__main__": main()

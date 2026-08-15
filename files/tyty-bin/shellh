@@ -1,0 +1,24 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# shellh — Export all ADB and tyadb related history to shared storage
+
+TARGET_DIR="/sdcard/termux-shared"
+# Fallback to shared storage link
+[ -d "$TARGET_DIR" ] || TARGET_DIR="$HOME/storage/shared/termux-shared"
+mkdir -p "$TARGET_DIR"
+
+OUT_FILE="$TARGET_DIR/tyadb_history_$(date +%Y%m%d).json"
+
+echo "⏳ Harvesting all ADB & tyadb activity from session logs..."
+
+# Scan all session logs, filtering for anything containing 'adb' or 'tyadb'
+# This includes prompts, thoughts, tool calls, and responses.
+find "$HOME/.gemini/tmp" -name "*.jsonl" -type f -print0 | xargs -0 jq -sc \
+  'map(select(tostring | ascii_downcase | (contains("adb") or contains("tyadb")))) | flatten | .[]' > "$OUT_FILE"
+
+if [ -s "$OUT_FILE" ]; then
+    termux-toast "📊 ADB History Exported"
+    echo "Success! Compiled ADB history saved to: $OUT_FILE"
+else
+    echo "❌ No ADB-related history found to export."
+    rm -f "$OUT_FILE"
+fi

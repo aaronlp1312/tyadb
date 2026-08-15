@@ -1,0 +1,97 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+TYDROID_ROOT="${TYDROID_ROOT:-$HOME/tydroid}"
+ENV_FILE="${TYADB_ENV:-$HOME/tyadb.env}"
+[ -r "$ENV_FILE" ] || ENV_FILE="$TYDROID_ROOT/config/tyadb.env"
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+D="$TYDROID_ROOT/tyty/bin/tyty-adb-daemon.sh"
+PID="${TYADB_STATE_DIR:-$HOME/.config/tyadb}/tyadb-daemon.pid"
+LOG="$HOME/.local/state/tyadb/tyadb-daemon.log"
+CONF="$TYDROID_ROOT/config/tyty-adb.conf"
+cmd="${1:-help}"
+
+notice(){
+  echo "tyty-adb-ctl is a quarantined compatibility name; prefer: tyadb, tyadb-status, tybridge-*"
+}
+
+doctor(){
+  echo "== tyadb doctor =="
+  echo "- which adb: $(command -v adb || echo '<none>')"
+  echo "- ADB_BIN   : ${ADB_BIN:-<unset>}"
+  echo "- env file  : $ENV_FILE"
+  echo "- LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-<empty>}"
+  __tyrun version || true
+  echo
+  echo "- mdns (3 lines):"
+  __tyrun mdns services 2>/dev/null | sed -n '1,3p' || true
+  echo
+  echo "- vendor keys: ${ADB_VENDOR_KEYS:-$HOME/.android}"
+  [ -d "${ADB_VENDOR_KEYS:-$HOME/.android}" ] && ls -1 "${ADB_VENDOR_KEYS:-$HOME/.android}" | sed 's/^/  - /'
+}
+
+case "$cmd" in
+  start)
+    notice
+    # singleton check using lock
+    exec 9>"$PID.lock"
+    if ! flock -n 9; then
+      if [ -f "$PID" ]; then
+        echo "Running (PID $(cat "$PID"))"
+      else
+        echo "Running (lock held)"
+      fi
+      exit 0
+    fi
+    # Close the lock file so the daemon can acquire it
+    exec 9>&-
+
+    echo "Start tyadb daemon..."
+    nohup "$D" >/dev/null 2>&1 &
+    sleep 1
+    if [ -f "$PID" ]; then
+      echo "Started (PID $(cat "$PID"))"
+    else
+      echo "Failed. See logs: $LOG"
+      exit 1
+    fi
+    ;;
+  stop)
+    if [ -f "$PID" ]; then
+      kill "$(cat "$PID")" 2>/dev/null || true
+      rm -f "$PID"
+      echo "Stopped."
+    else
+      echo "Not running."
+    fi
+    ;;
+  restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+  status)
+    echo "=== TyADB Status ==="
+    if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then
+      echo "Daemon: Running (PID $(cat "$PID"))"
+    else
+      echo "Daemon: Stopped"
+    fi
+    echo
+    echo "ADB Devices:"
+    __tyrun devices -l
+    ;;
+  logs)
+    tail -f "$LOG"
+    ;;
+  edit)
+    ${EDITOR:-nano} "$CONF"
+    ;;
+  doctor)
+    doctor
+    ;;
+  *)
+    notice
+    echo "Usage: $(basename "$0") {start|stop|restart|status|logs|edit|doctor}"
+    ;;
+esac

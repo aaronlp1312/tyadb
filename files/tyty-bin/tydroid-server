@@ -1,0 +1,28 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Tydroid Material 3 Web Server
+# Serves the Command Center UI on port 1312
+
+WWW_DIR="$HOME/environments/tyty-droid/www"
+PORT=1312
+
+if [ ! -d "$WWW_DIR" ]; then
+    echo "Error: $WWW_DIR not found. Creating it..."
+    mkdir -p "$WWW_DIR"
+fi
+
+cd "$WWW_DIR"
+echo "Tydroid UI Server launching at http://localhost:$PORT"
+
+exec python3 - <<EOF
+import http.server, socketserver
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        super().end_headers()
+
+with socketserver.TCPServer(("", $PORT), Handler) as httpd:
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+EOF

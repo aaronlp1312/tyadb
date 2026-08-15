@@ -1,0 +1,113 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+CFG="$HOME/.config/tyty"
+LAST="$CFG/last_host"
+ADB_DEFAULT="$HOME/environments/tyty-droid/bin/adb"
+ADB_BIN="${ADB_DEFAULT:-adb}"
+[ -x "$ADB_DEFAULT" ] || ADB_BIN="adb"
+
+# Helpers
+save_host() { echo "$1" > "$LAST"; }
+get_host()  { [ -f "$LAST" ] && cat "$LAST" || echo "IP:PORT"; }
+
+msg() { printf "\n\033[1;36m%s\033[0m\n" "$*"; }
+warn(){ printf "\033[1;33m%s\033[0m\n" "$*"; }
+ok()  { printf "\033[1;32m%s\033[0m\n" "$*"; }
+err() { printf "\033[1;31m%s\033[0m\n" "$*"; }
+
+ensure_server() {
+  "$ADB_BIN" start-server >/dev/null 2>&1 || true
+}
+
+devices() {
+  ensure_server
+  msg "Devices"
+  "$ADB_BIN" devices -l || true
+}
+
+pair_new() {
+  read -p "Pair host (IP:PAIR_PORT)  : " host
+  read -p "Pairing code (6 digits)   : " code
+  if "$ADB_BIN" pair "$host" "$code"; then
+    ok "Paired: $host"
+    save_host "$host"
+  else
+    err "Pair failed."
+  fi
+}
+
+connect_host() {
+  default=$(get_host)
+  read -p "Connect host (IP:PORT) [$default]: " host
+  host="${host:-$default}"
+  if "$ADB_BIN" connect "$host"; then
+    ok "Connected to $host"
+    save_host "$host"
+  else
+    err "Connect failed."
+  fi
+}
+
+open_shell() {
+  msg "Opening ADB shell… (type 'exit' to return)"
+  "$ADB_BIN" shell || true
+}
+
+quick_tests() {
+  msg "Quick tests"
+  "$ADB_BIN" get-state || true
+  "$ADB_BIN" shell getprop ro.product.model 2>/dev/null || true
+  "$ADB_BIN" shell whoami 2>/dev/null || true
+  "$ADB_BIN" shell pm list packages -3 2>/dev/null | head -10 || true
+}
+
+toggle_night() {
+  # 1=auto (deprecated on newer), 2=on, 1 or 0 used differently across builds.
+  # We'll flip between 2 (on) and 1 (off-ish) for consistency with your flow.
+  cur=$("$ADB_BIN" shell settings get secure ui_night_mode 2>/dev/null | tr -d '\r')
+  case "$cur" in
+    2) new=1; lbl="OFF" ;;
+    *) new=2; lbl="ON"  ;;
+  esac
+  if "$ADB_BIN" shell settings put secure ui_night_mode "$new"; then
+    ok "Night mode: $lbl  (value=$new)"
+  else
+    err "Failed to toggle. (Need ADB shell permission)"
+  fi
+}
+
+restart_adb() {
+  msg "Restarting ADB server…"
+  "$ADB_BIN" kill-server || true
+  "$ADB_BIN" start-server || true
+  ok "ADB restarted."
+}
+
+tail_logs() {
+  msg "Last 200 log lines"
+  "$ADB_BIN" logcat -d 2>/dev/null | tail -200 || true
+}
+
+# Menu (fzf if available, fallback to simple select)
+menu_items=$'Devices\nPair New\nConnect\nShell\nQuick Tests\nToggle Night Mode\nRestart ADB\nLogs (tail)\nExit'
+if command -v fzf >/dev/null 2>&1; then
+  choice=$(printf "%s" "$menu_items" | fzf --height=40% --prompt="tyty-quick > " || true)
+else
+  PS3="tyty-quick > "
+  select choice in Devices "Pair New" Connect Shell "Quick Tests" "Toggle Night Mode" "Restart ADB" "Logs (tail)" Exit; do
+    break
+  done
+fi
+
+case "$choice" in
+  Devices)            devices ;;
+  "Pair New")         pair_new ;;
+  Connect)            connect_host ;;
+  Shell)              open_shell ;;
+  "Quick Tests")      quick_tests ;;
+  "Toggle Night Mode")toggle_night ;;
+  "Restart ADB")      restart_adb ;;
+  "Logs (tail)")      tail_logs ;;
+  *)                  exit 0 ;;
+esac

@@ -1,0 +1,17 @@
+#!/data/data/com.termux/files/usr/bin/bash
+LOG="$HOME/.local/state/tybridge.log"
+PID="$HOME/.local/state/tybridge.pid"
+BRIDGE="$HOME/tydroid/tyty/bin/ty-core"
+mkdir -p "$(dirname "$LOG")"
+# kill stray old bridge process
+pkill -f '[t]y-core' 2>/dev/null || true
+rm -f "$PID"
+setsid "$BRIDGE" </dev/null >>"$LOG" 2>&1 &
+echo $! > "$PID"
+sleep 0.3
+if kill -0 "$(cat "$PID")" 2>/dev/null; then
+  echo "[tybridge] started (pid $(cat "$PID")), logging to $LOG"
+else
+  echo "[tybridge] failed to stay running; see $LOG"
+  exit 1
+fi

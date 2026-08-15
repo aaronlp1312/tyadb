@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/usr/bin/sh
+printf '%s\n' 'tyty-adb is a compatibility name; prefer: tyadb panel' >&2
+exec tyadb panel "$@"

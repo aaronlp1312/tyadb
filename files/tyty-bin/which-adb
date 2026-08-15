@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/usr/bin/bash
+echo "system adb: $(command -v adb)"
+echo "sandbox adb: $HOME/sandbox/bin/adb"
+echo "PATH: $PATH"

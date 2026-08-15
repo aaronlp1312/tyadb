@@ -1,0 +1,23 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+adb start-server >/dev/null 2>&1 || true
+
+target="$1"
+
+# If no host:port given, try Wireless Debugging discovery (TLS)
+if [ -z "$target" ]; then
+  # pick the first _adb-tls-connect entry
+  target=$(adb mdns services 2>/dev/null \
+           | awk '/_adb-tls-connect/ {print $NF}' \
+           | head -n1)
+fi
+
+if [ -z "$target" ]; then
+  echo "No wireless-debug device found via mDNS."
+  echo "Tip: on the phone enable Developer options → Wireless debugging, then Pair device."
+  exit 1
+fi
+
+echo "Connecting to $target ..."
+adb connect "$target" >/dev/null
+adb -s "$target" shell

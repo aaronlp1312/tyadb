@@ -1,0 +1,80 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ty-apk-tool — Advanced APK Analysis & Staging
+set -Eeuo pipefail
+. "$HOME/tyadb.env"
+
+WORKSPACE="$HOME/environments/tyty-droid/apk_analysis"
+INPUT_DIR="$WORKSPACE/input"
+OUTPUT_DIR="$WORKSPACE/output"
+
+usage() {
+    echo "usage: ty-apk-tool <command> [args]"
+    echo "commands:"
+    echo "  stage <path>     Copy APK to input folder"
+    echo "  find             Find APKs in common locations"
+    echo "  analyze <path>   Run full analysis (AAPT, Androguard, JADX, APKTool)"
+    echo "  perms <path>     Quick permission check"
+    echo "  list             Show staged APKs"
+    exit 1
+}
+
+[ $# -ge 1 ] || usage
+CMD="$1"; shift
+
+case "$CMD" in
+    stage)
+        [ -n "${1:-}" ] || usage
+        mkdir -p "$INPUT_DIR"
+        cp "$1" "$INPUT_DIR/"
+        echo "✅ APK staged: $(basename "$1")"
+        ;;
+    find)
+        echo "📱 APK files found:"
+        echo "Downloads:"
+        find /sdcard/Download -name "*.apk" -maxdepth 1 -type f 2>/dev/null | sed 's/^/ • /'
+        echo "Input folder:"
+        find "$INPUT_DIR" -name "*.apk" -maxdepth 1 -type f 2>/dev/null | sed 's/^/ • /'
+        echo "Current dir:"
+        find . -maxdepth 1 -name "*.apk" -type f 2>/dev/null | sed 's/^/ • /'
+        ;;
+    analyze)
+        [ -n "${1:-}" ] || usage
+        APK="$1"
+        BN=$(basename "$APK" .apk)
+        OUT="$OUTPUT_DIR/$BN"
+        mkdir -p "$OUT"
+        echo "🔍 Analyzing $APK..."
+        
+        # 1. AAPT info
+        if command -v aapt >/dev/null; then
+            aapt dump badging "$APK" > "$OUT/badging.txt" 2>/dev/null
+            echo " • Extracted manifest info"
+        fi
+        
+        # 2. Androguard (if quick_analysis.py exists)
+        if [ -f "$WORKSPACE/quick_analysis.py" ]; then
+            python3 "$WORKSPACE/quick_analysis.py" "$APK" > "$OUT/androguard.txt" 2>/dev/null
+            echo " • Finished static analysis"
+        fi
+        
+        # 3. JADX Decompile (Background)
+        if command -v jadx >/dev/null; then
+            echo " • Starting JADX decompile (this takes time)..."
+            jadx -d "$OUT/jadx" "$APK" >/dev/null 2>&1 &
+        fi
+        
+        echo "✅ Results will be in: $OUT"
+        ;;
+    perms)
+        [ -n "${1:-}" ] || usage
+        if command -v aapt >/dev/null; then
+            aapt dump permissions "$1"
+        else
+            echo "aapt not found. Check SDK setup."
+        fi
+        ;;
+    list)
+        ls -lh "$INPUT_DIR" 2>/dev/null || echo "Input folder empty."
+        ;;
+    *) usage ;;
+esac

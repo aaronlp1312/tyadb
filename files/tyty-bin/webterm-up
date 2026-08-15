@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/usr/bin/bash
+"$HOME/tydroid-server/start.sh"
+echo "Open: http://127.0.0.1:1312/"
+termux-open-url http://127.0.0.1:1312/ 2>/dev/null || am start -a android.intent.action.VIEW -d http://127.0.0.1:1312/ >/dev/null 2>&1 || true

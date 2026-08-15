@@ -1,0 +1,68 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# --- 1. Setup ---
+PROJECT_NAME="${1:-new_project}"
+PORT=3000
+[ ! -d "$PROJECT_NAME" ] && mkdir -p "$PROJECT_NAME"
+cd "$PROJECT_NAME"
+
+# --- 2. The Reusable Bridge (Boilerplate) ---
+# This creates index.html if it doesn't exist
+if [ ! -f "index.html" ]; then
+cat <<EOF > index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>$PROJECT_NAME</title>
+    <script>
+      const _log = console.log;
+      console.log = (...args) => {
+        fetch('/__log', { method: 'POST', body: JSON.stringify({ logs: args, type: 'info' }) });
+        _log.apply(console, args);
+      };
+      window.onerror = (m, u, l) => {
+        fetch('/__log', { method: 'POST', body: JSON.stringify({ logs: [\`\${m} (Line \${l})\`], type: 'error' }) });
+      };
+    </script>
+</head>
+<body>
+    <h1>Project: $PROJECT_NAME</h1>
+</body>
+</html>
+EOF
+fi
+
+# Create empty CSS/JS if missing
+touch style.css script.js
+
+# --- 3. Start Background Server (Live Engine) ---
+browser-sync start --server --files "**/*" --port "$PORT" --no-notify --middleware '
+[
+  {
+    route: "/__log",
+    handle: function (req, res, next) {
+      if (req.method === "POST") {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+          const data = JSON.parse(body);
+          const color = data.type === "error" ? "\x1b[31m" : "\x1b[32m";
+          process.stdout.write(`\n${color}[BROWSER] ${data.logs.join(" ")}\x1b[0m\n`);
+          res.end("ok");
+        });
+      } else { next(); }
+    }
+  }
+]
+' >/dev/null 2>&1 &
+SERVER_PID=$!
+
+# --- 4. Launch Editor (nvim) ---
+# This opens the directory in Neovim
+nvim .
+
+# --- 5. Cleanup ---
+# Shuts down the server when you exit nvim
+kill $SERVER_PID
+termux-toast "Dev session closed."
+

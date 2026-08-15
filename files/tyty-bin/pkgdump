@@ -1,0 +1,169 @@
+#!/usr/bin/env zsh
+# pkgdump -- dump installed packages to JSON with user/system split
+
+RAWICONS="/storage/emulated/0/rawappicons"
+OUTFILE="/sdcard/Download/pkgdump.json"
+TMPDIR="$HOME/.cache/pkgdump"
+TMPAPK="$TMPDIR/tmp.apk"
+DUMPFILE="$TMPDIR/dumpsys.txt"
+PYFILE="$TMPDIR/parse.py"
+
+mkdir -p "$TMPDIR"
+
+# -- locate adb
+ADB=$(command -v tyadb || command -v adb || true)
+[[ -z "$ADB" ]] && { termux-notification -t "pkgdump" --content "adb not found"; exit 1; }
+
+# -- get serial
+SERIAL=$($ADB devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')
+[[ -z "$SERIAL" ]] && { termux-notification -t "pkgdump" --content "No device connected"; exit 1; }
+
+termux-notification -t "pkgdump" --content "Pulling package data..."
+
+$ADB -s "$SERIAL" shell dumpsys package packages > "$DUMPFILE" 2>/dev/null
+[[ ! -s "$DUMPFILE" ]] && { termux-notification -t "pkgdump" --content "Dump failed - check adb connection"; exit 1; }
+
+termux-notification -t "pkgdump" --content "Parsing..."
+
+# -- write python parser
+cat > "$PYFILE" << 'PYEOF'
+import subprocess, json, os, sys, re
+from datetime import datetime
+
+adb, serial, rawicons, outfile, tmpapk, dumpfile = sys.argv[1:]
+
+def pkg_tail_label(pkg):
+    return pkg.split('.')[-1].replace('_', ' ').capitalize()
+
+def find_icon(pkg, rawicons):
+    try:
+        for f in os.listdir(rawicons):
+            if f.startswith(pkg + '__'):
+                return os.path.join(rawicons, f)
+    except:
+        pass
+    return ""
+
+def pull_apk(code_path):
+    for target in [code_path.rstrip('/') + '/base.apk', code_path]:
+        r = subprocess.run(
+            [adb, '-s', serial, 'pull', target, tmpapk],
+            capture_output=True
+        )
+        if r.returncode == 0 and os.path.exists(tmpapk):
+            return True
+    return False
+
+def get_label_aapt(apk_path):
+    try:
+        out = subprocess.check_output(
+            ['aapt', 'dump', 'badging', apk_path],
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8', errors='ignore')
+        for line in out.splitlines():
+            m = re.match(r"^application-label:'(.*)'$", line)
+            if m:
+                return m.group(1)
+    except:
+        pass
+    return None
+
+def notify(msg):
+    subprocess.run(
+        ['termux-notification', '-t', 'pkgdump', '--content', msg],
+        capture_output=True
+    )
+
+# -- parse dumpsys
+with open(dumpfile, 'r', errors='ignore') as f:
+    content = f.read()
+
+packages = {}
+cur = None
+
+for line in content.splitlines():
+    line = line.strip()
+
+    m = re.match(r'^Package \[([^\]]+)\]', line)
+    if m:
+        cur = m.group(1)
+        packages[cur] = {
+            'package': cur,
+            'name': '',
+            'icon': '',
+            'versionName': '',
+            'versionCode': '',
+            'codePath': '',
+            'dataDir': '',
+            'system': False
+        }
+        continue
+
+    if cur is None:
+        continue
+
+    if line.startswith('versionCode='):
+        packages[cur]['versionCode'] = line.split('=', 1)[1].split()[0]
+    elif line.startswith('versionName='):
+        packages[cur]['versionName'] = line.split('=', 1)[1]
+    elif line.startswith('codePath='):
+        packages[cur]['codePath'] = line.split('=', 1)[1]
+    elif line.startswith('dataDir='):
+        packages[cur]['dataDir'] = line.split('=', 1)[1]
+    elif line.startswith('flags=') and 'SYSTEM' in line:
+        packages[cur]['system'] = True
+
+user_apps = []
+system_apps = []
+
+total_user = sum(1 for p in packages.values() if not p['system'])
+processed = 0
+
+for pkg, data in packages.items():
+    data['icon'] = find_icon(pkg, rawicons)
+
+    if data['system']:
+        data['name'] = pkg_tail_label(pkg)
+        system_apps.append(data)
+    else:
+        processed += 1
+        label = None
+        if data['codePath']:
+            if pull_apk(data['codePath']):
+                label = get_label_aapt(tmpapk)
+                try:
+                    os.remove(tmpapk)
+                except:
+                    pass
+        data['name'] = label if label else pkg_tail_label(pkg)
+        user_apps.append(data)
+
+        if processed % 10 == 0:
+            notify(f"User apps: {processed}/{total_user}")
+
+user_apps.sort(key=lambda x: x['name'].lower())
+system_apps.sort(key=lambda x: x['name'].lower())
+
+output = {
+    'generated': datetime.now().isoformat(),
+    'counts': {'user': len(user_apps), 'system': len(system_apps)},
+    'user': user_apps,
+    'system': system_apps
+}
+
+with open(outfile, 'w') as f:
+    json.dump(output, f, indent=2)
+
+print(f"Done: {len(user_apps)} user / {len(system_apps)} system")
+PYEOF
+
+python3 "$PYFILE" "$ADB" "$SERIAL" "$RAWICONS" "$OUTFILE" "$TMPAPK" "$DUMPFILE"
+
+STATUS=$?
+rm -f "$PYFILE" "$DUMPFILE"
+
+if [[ $STATUS -eq 0 ]]; then
+    termux-notification -t "pkgdump" --content "Done -- saved to Downloads/pkgdump.json"
+else
+    termux-notification -t "pkgdump" --content "pkgdump failed -- check output"
+fi

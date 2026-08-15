@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/bash
+if pgrep -f '[t]y-core' >/dev/null; then
+  echo "[tybridge] running (pid(s): $(pgrep -f '[t]y-core' | tr '\n' ' '))"
+else
+  echo "[tybridge] not running"
+fi
+# try health on 1313 then 1314..1320
+ok=""
+if curl -fs http://127.0.0.1:1313/health >/dev/null; then ok="http://127.0.0.1:1313"
+else
+  for p in $(seq 1314 1320); do
+    if curl -fs "http://127.0.0.1:$p/health" >/dev/null; then ok="http://127.0.0.1:$p"; break; fi
+  done
+fi
+[ -n "$ok" ] && echo "[tybridge] health: OK at $ok" || echo "[tybridge] health: not responding"

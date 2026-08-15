@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Enter unified workspace with friendly banner
+export ENV_TAG='[tyty]'
+cd "$HOME/environments/tyty-droid" 2>/dev/null || cd "$HOME"
+echo "Tyty & Droid online."
+exec ${SHELL:-/data/data/com.termux/files/usr/bin/bash} -i
