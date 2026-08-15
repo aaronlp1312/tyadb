@@ -1,0 +1,909 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Tydroid ADB command hub.
+# Clean-room lifecycle wrapper around adb: no borrowed app identifiers, services,
+# process names, or protocol constants.
+set -euo pipefail
+
+TYADB_NAME="tyadb"
+TYADB_PREFIX="[tyadb]"
+ADB_BIN="${TYADB_ADB_BIN:-$HOME/lib/tyty/adb}"
+[ -x "$ADB_BIN" ] || ADB_BIN="$(command -v adb || true)"
+
+TYADB_HOME="${TYADB_HOME:-$HOME/.tydroid/adb}"
+TYADB_STATE_DIR="${TYADB_STATE_DIR:-$HOME/.local/state/tydroid/adb}"
+TYADB_CONFIG_DIR="${TYADB_CONFIG_DIR:-$HOME/.config/tydroid/adb}"
+TYADB_LOG_DIR="${TYADB_LOG_DIR:-$HOME/.local/state/tydroid/logs}"
+TYADB_SHARED_DIR="${TYADB_SHARED_DIR:-/storage/emulated/0/Download/Termux-shared}"
+TYADB_BRIDGE_PORT="${TYADB_BRIDGE_PORT:-1313}"
+TYADB_UI_PORT="${TYADB_UI_PORT:-1312}"
+TYADB_DEFAULT_HOST="${TYADB_DEFAULT_HOST:-}"
+TYADB_REQUIRE_ALLOWLIST="${TYADB_REQUIRE_ALLOWLIST:-0}"
+
+TYADB_LAST_HOST_FILE="$TYADB_STATE_DIR/last_host"
+TYADB_LAST_SERIAL_FILE="$TYADB_STATE_DIR/last_serial"
+TYADB_SESSION_FILE="$TYADB_STATE_DIR/session.env"
+TYADB_ALLOWLIST_FILE="$TYADB_CONFIG_DIR/allowed-shell.txt"
+TYADB_STATUS_FILE="$TYADB_STATE_DIR/status.env"
+TYADB_LOG_FILE="$TYADB_LOG_DIR/tyadb.log"
+TYADB_WATCH_PID_FILE="$TYADB_STATE_DIR/watch.pid"
+TYADB_WATCH_INTERVAL="${TYADB_WATCH_INTERVAL:-8}"
+
+mkdir -p "$TYADB_HOME" "$TYADB_STATE_DIR" "$TYADB_CONFIG_DIR" "$TYADB_LOG_DIR"
+
+say() { printf '%s %s\n' "$TYADB_PREFIX" "$*"; }
+err() { printf '%s %s\n' "$TYADB_PREFIX" "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+log_event() { printf '%s %s %s\n' "$(iso_utc)" "$TYADB_PREFIX" "$*" >> "$TYADB_LOG_FILE"; }
+
+adb_run() {
+  [ -n "$ADB_BIN" ] || { err "adb missing: install android-tools or set TYADB_ADB_BIN"; return 127; }
+  "$ADB_BIN" "$@"
+}
+
+iso_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+epoch_now() { date -u '+%s'; }
+
+ms_now() {
+  local ms
+  ms="$(date '+%s%3N' 2>/dev/null || true)"
+  case "$ms" in
+    *N*|"") printf '%s000' "$(date '+%s')" ;;
+    *) printf '%s' "$ms" ;;
+  esac
+}
+
+split_host() {
+  local hp="$1"
+  printf '%s' "${hp%:*}"
+}
+
+split_port() {
+  local hp="$1"
+  if [ "$hp" != "${hp%:*}" ]; then
+    printf '%s' "${hp##*:}"
+  else
+    printf '5555'
+  fi
+}
+
+transport_for_serial() {
+  case "$1" in
+    *:*) printf 'tcpip' ;;
+    "") printf 'unknown' ;;
+    *) printf 'usb' ;;
+  esac
+}
+
+load_session() {
+  if [ -f "$TYADB_SESSION_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$TYADB_SESSION_FILE"
+  fi
+}
+
+write_session() {
+  local host="$1" port="$2" serial="$3" connected="$4" protocol="$5"
+  local now epoch state
+  now="$(iso_utc)"
+  epoch="$(epoch_now)"
+  state="$(adb_run -s "$serial" get-state 2>/dev/null || true)"
+  [ -n "$state" ] || state="unknown"
+  {
+    printf 'TYADB_HOST=%q\n' "$host"
+    printf 'TYADB_PORT=%q\n' "$port"
+    printf 'TYADB_SERIAL=%q\n' "$serial"
+    printf 'TYADB_CONNECTED=%q\n' "$connected"
+    printf 'TYADB_LAST_CONNECT=%q\n' "$now"
+    printf 'TYADB_LAST_CONNECT_EPOCH=%q\n' "$epoch"
+    printf 'TYADB_PROTOCOL=%q\n' "$protocol"
+    printf 'TYADB_STATE=%q\n' "$state"
+  } > "$TYADB_SESSION_FILE"
+  printf '%s:%s\n' "$host" "$port" > "$TYADB_LAST_HOST_FILE"
+  printf '%s\n' "$serial" > "$TYADB_LAST_SERIAL_FILE"
+}
+
+clear_connected_session() {
+  load_session
+  if [ -n "${TYADB_SERIAL:-}" ]; then
+    write_session "${TYADB_HOST:-}" "${TYADB_PORT:-}" "$TYADB_SERIAL" 0 "${TYADB_PROTOCOL:-unknown}" || true
+  fi
+}
+
+save_status() {
+  load_session
+  {
+    printf 'TYADB_UPDATED=%q\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'TYADB_ADB_BIN=%q\n' "${ADB_BIN:-}"
+    printf 'TYADB_STATE_DIR=%q\n' "$TYADB_STATE_DIR"
+    printf 'TYADB_LAST_HOST=%q\n' "$([ -s "$TYADB_LAST_HOST_FILE" ] && cat "$TYADB_LAST_HOST_FILE" || true)"
+    printf 'TYADB_LAST_SERIAL=%q\n' "$([ -s "$TYADB_LAST_SERIAL_FILE" ] && cat "$TYADB_LAST_SERIAL_FILE" || true)"
+    printf 'TYADB_SESSION_FILE=%q\n' "$TYADB_SESSION_FILE"
+    printf 'TYADB_SESSION_SERIAL=%q\n' "${TYADB_SERIAL:-}"
+  } > "$TYADB_STATUS_FILE"
+}
+
+core_status() {
+  if have curl && curl -fs "http://127.0.0.1:$TYADB_BRIDGE_PORT/health" >/dev/null 2>&1; then
+    printf 'OK'
+  else
+    printf 'DOWN'
+  fi
+}
+
+ui_status() {
+  if have curl && curl -fs "http://127.0.0.1:$TYADB_UI_PORT/" >/dev/null 2>&1; then
+    printf 'OK'
+  else
+    printf 'DOWN'
+  fi
+}
+
+server_status() {
+  if adb_run get-state >/dev/null 2>&1 || adb_run devices >/dev/null 2>&1; then
+    printf 'OK'
+  else
+    printf 'DOWN'
+  fi
+}
+
+connected_count() {
+  adb_run devices 2>/dev/null | awk '/\tdevice$/ {count++} END {print count+0}'
+}
+
+first_connected_serial() {
+  adb_run devices 2>/dev/null | awk '/\tdevice$/ {print $1; exit}'
+}
+
+wait_for_serial() {
+  local serial="$1" tries="${2:-8}" state
+  while [ "$tries" -gt 0 ]; do
+    state="$(adb_run -s "$serial" get-state 2>/dev/null || true)"
+    [ "$state" = "device" ] && return 0
+    sleep 1
+    tries=$((tries - 1))
+  done
+  return 1
+}
+
+verify_serial() {
+  local serial="$1"
+  wait_for_serial "$serial" 8 || return 1
+  adb_run -s "$serial" shell 'echo tyadb-ok' 2>/dev/null | grep -q 'tyadb-ok'
+}
+
+save_serial_from_devices() {
+  local serial
+  serial="$(first_connected_serial || true)"
+  if [ -n "$serial" ]; then
+    printf '%s\n' "$serial" > "$TYADB_LAST_SERIAL_FILE"
+    say "saved serial: $serial"
+  else
+    err "save serial skipped: no connected device"
+    return 1
+  fi
+}
+
+save_session_from_serial() {
+  local serial="$1" host port protocol
+  protocol="$(transport_for_serial "$serial")"
+  if [ "$protocol" = "tcpip" ]; then
+    host="$(split_host "$serial")"
+    port="$(split_port "$serial")"
+  else
+    host="${TYADB_HOST:-}"
+    port="${TYADB_PORT:-}"
+  fi
+  write_session "$host" "$port" "$serial" 1 "$protocol"
+  say "saved session: $serial"
+}
+
+connected_serial() {
+  load_session
+  if [ -n "${TYADB_SERIAL:-}" ] && adb_run -s "$TYADB_SERIAL" get-state >/dev/null 2>&1; then
+    printf '%s' "$TYADB_SERIAL"
+    return 0
+  fi
+  first_connected_serial
+}
+
+mdns_candidate() {
+  load_session
+  local preferred_host="${TYADB_HOST:-}"
+  [ -z "$preferred_host" ] && [ -s "$TYADB_LAST_HOST_FILE" ] && preferred_host="$(split_host "$(cat "$TYADB_LAST_HOST_FILE")")"
+
+  adb_run mdns services 2>/dev/null | awk -v preferred="$preferred_host" '
+    /_adb-tls-connect\._tcp/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) {
+          if (preferred == "" || index($i, preferred ":") == 1) {
+            print $i
+            exit
+          }
+          if (fallback == "") fallback = $i
+        }
+      }
+    }
+    END {
+      if (preferred == "" && fallback != "") print fallback
+    }
+  ' | sed -n '1p'
+}
+
+last_connect_age() {
+  load_session
+  [ -n "${TYADB_LAST_CONNECT_EPOCH:-}" ] || { printf '<never>'; return 0; }
+  local now age
+  now="$(epoch_now)"
+  age=$((now - TYADB_LAST_CONNECT_EPOCH))
+  if [ "$age" -lt 60 ]; then
+    printf '%ss ago' "$age"
+  elif [ "$age" -lt 3600 ]; then
+    printf '%sm ago' "$((age / 60))"
+  elif [ "$age" -lt 86400 ]; then
+    printf '%sh ago' "$((age / 3600))"
+  else
+    printf '%sd ago' "$((age / 86400))"
+  fi
+}
+
+allowlist_status() {
+  if [ "$TYADB_REQUIRE_ALLOWLIST" = "1" ]; then
+    [ -f "$TYADB_ALLOWLIST_FILE" ] && printf 'enabled' || printf 'enabled, missing file'
+  else
+    printf 'disabled'
+  fi
+}
+
+cmd_start() {
+  say "starting adb server"
+  adb_run start-server
+}
+
+cmd_stop() {
+  say "stopping adb server"
+  adb_run kill-server
+}
+
+cmd_restart() {
+  cmd_stop || true
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  local count serial saved_serial connection host port protocol state last_success
+  load_session
+  count="$(connected_count || printf '0')"
+  serial="$(connected_serial || true)"
+  if [ -n "$serial" ]; then
+    connection="Connected"
+    state="$(adb_run -s "$serial" get-state 2>/dev/null || printf 'unknown')"
+    protocol="$(transport_for_serial "$serial")"
+    if [ "$protocol" = "tcpip" ]; then
+      host="$(split_host "$serial")"
+      port="$(split_port "$serial")"
+    else
+      host="${TYADB_HOST:-<usb>}"
+      port="${TYADB_PORT:-}"
+    fi
+  else
+    connection="Disconnected"
+    state="disconnected"
+    protocol="${TYADB_PROTOCOL:-unknown}"
+    host="${TYADB_HOST:-$([ -s "$TYADB_LAST_HOST_FILE" ] && split_host "$(cat "$TYADB_LAST_HOST_FILE")" || true)}"
+    port="${TYADB_PORT:-$([ -s "$TYADB_LAST_HOST_FILE" ] && split_port "$(cat "$TYADB_LAST_HOST_FILE")" || true)}"
+    saved_serial="${TYADB_SERIAL:-$([ -s "$TYADB_LAST_SERIAL_FILE" ] && cat "$TYADB_LAST_SERIAL_FILE" || true)}"
+  fi
+  last_success="$(last_connect_age)"
+  save_status
+
+  printf '=== tyadb status ===\n'
+  printf 'ADB:             %s\n' "${ADB_BIN:-<missing>}"
+  printf 'Server:          %s\n' "$(server_status)"
+  printf 'Connection:      %s\n' "$connection"
+  printf 'Transport:       %s\n' "$protocol"
+  printf 'Current host:    %s\n' "${host:-<none>}${port:+:$port}"
+  printf 'Serial:          %s\n' "${serial:-<none>}"
+  [ -n "${saved_serial:-}" ] && printf 'Saved serial:    %s\n' "$saved_serial"
+  printf 'Device state:    %s\n' "$state"
+  printf 'Device count:    %s connected\n' "$count"
+  printf 'Last successful: %s\n' "$last_success"
+  printf 'Allowlist:       %s\n' "$(allowlist_status)"
+  if [ -s "$TYADB_WATCH_PID_FILE" ] && kill -0 "$(cat "$TYADB_WATCH_PID_FILE")" 2>/dev/null; then
+    printf 'Watcher:         running (pid %s)\n' "$(cat "$TYADB_WATCH_PID_FILE")"
+  else
+    printf 'Watcher:         stopped\n'
+  fi
+  printf 'Core API:        %s (:%s)\n' "$(core_status)" "$TYADB_BRIDGE_PORT"
+  printf 'UI API:          %s (:%s)\n' "$(ui_status)" "$TYADB_UI_PORT"
+  printf 'Session file:    %s\n' "$TYADB_SESSION_FILE"
+  printf 'State dir:       %s\n' "$TYADB_STATE_DIR"
+  printf 'Shared dir:      %s' "$TYADB_SHARED_DIR"
+  [ -d "$TYADB_SHARED_DIR" ] && printf ' (exists)\n' || printf ' (missing or no permission)\n'
+  printf '\nADB devices:\n'
+  adb_run devices -l || true
+}
+
+cmd_doctor() {
+  printf '=== tyadb doctor ===\n'
+  if [ -n "$ADB_BIN" ]; then
+    printf 'OK   adb found: %s\n' "$ADB_BIN"
+    adb_run version 2>/dev/null | sed -n '1,2p' || true
+  else
+    printf 'FAIL adb missing: install android-tools or set TYADB_ADB_BIN\n'
+  fi
+
+  [ -d "$TYADB_STATE_DIR" ] && printf 'OK   state dir: %s\n' "$TYADB_STATE_DIR" || printf 'FAIL state dir unavailable: %s\n' "$TYADB_STATE_DIR"
+  [ -d "$TYADB_CONFIG_DIR" ] && printf 'OK   config dir: %s\n' "$TYADB_CONFIG_DIR" || printf 'FAIL config dir unavailable: %s\n' "$TYADB_CONFIG_DIR"
+  [ -d "$TYADB_SHARED_DIR" ] && printf 'OK   shared dir: %s\n' "$TYADB_SHARED_DIR" || printf 'WARN shared dir unavailable: %s\n' "$TYADB_SHARED_DIR"
+
+  printf 'INFO core API: %s on port %s\n' "$(core_status)" "$TYADB_BRIDGE_PORT"
+  printf 'INFO web UI:   %s on port %s\n' "$(ui_status)" "$TYADB_UI_PORT"
+
+  if [ -s "$TYADB_LAST_HOST_FILE" ]; then
+    printf 'OK   saved host: %s\n' "$(cat "$TYADB_LAST_HOST_FILE")"
+  else
+    printf 'NEXT no saved host: run tyadb connect <host:5555>\n'
+  fi
+
+  if [ -s "$TYADB_LAST_SERIAL_FILE" ]; then
+    printf 'OK   saved serial: %s\n' "$(cat "$TYADB_LAST_SERIAL_FILE")"
+  else
+    printf 'NEXT no saved serial: connect a device, then run tyadb save-serial\n'
+  fi
+
+  if [ -s "$TYADB_SESSION_FILE" ]; then
+    printf 'OK   session file: %s\n' "$TYADB_SESSION_FILE"
+  else
+    printf 'NEXT no session file: run tyadb connect <host:5555>\n'
+  fi
+
+  printf '\nADB devices:\n'
+  adb_run devices -l || true
+
+  printf '\nmDNS services:\n'
+  adb_run mdns services 2>/dev/null | sed -n '1,8p' || printf 'WARN mdns unavailable or no services found\n'
+
+  printf '\nNext actions:\n'
+  printf '%s\n' '- Pair:      tyadb pair <host:pair_port> <code>'
+  printf '%s\n' '- Connect:   tyadb connect <host:5555>'
+  printf '%s\n' '- Reconnect: tyadb reconnect'
+  printf '%s\n' '- Ping:      tyadb ping'
+  printf '%s\n' '- Info:      tyadb info'
+  printf '%s\n' '- Status:    tyadb status'
+}
+
+cmd_pair() {
+  case "${1:-}" in help|-h|--help) echo "usage: tyadb pair <host:pair_port> <6-digit-code>"; return 0 ;; esac
+  [ $# -ge 2 ] || { err "pair failed: usage: tyadb pair <host:pair_port> <6-digit-code>"; return 2; }
+  say "pairing $1"
+  adb_run pair "$1" "$2"
+}
+
+cmd_connect() {
+  case "${1:-}" in help|-h|--help) echo "usage: tyadb connect [host:5555]"; return 0 ;; esac
+  local hp="${1:-}"
+  if [ -z "$hp" ]; then
+    if [ -s "$TYADB_LAST_HOST_FILE" ]; then
+      hp="$(cat "$TYADB_LAST_HOST_FILE")"
+    elif [ -n "$TYADB_DEFAULT_HOST" ]; then
+      hp="$TYADB_DEFAULT_HOST"
+      say "using default host: $hp"
+    else
+      err "connect failed: usage: tyadb connect <host[:port]>"
+      return 2
+    fi
+  fi
+
+  local host port serial
+  host="$(split_host "$hp")"
+  port="$(split_port "$hp")"
+  serial="$host:$port"
+
+  say "connecting $serial"
+  adb_run connect "$serial"
+  if ! verify_serial "$serial"; then
+    err "connect failed: transport did not verify: $serial"
+    return 1
+  fi
+  write_session "$host" "$port" "$serial" 1 "tcpip"
+  say "saved session: $serial"
+  adb_run devices -l
+}
+
+cmd_reconnect() {
+  case "${1:-}" in help|-h|--help) echo "usage: tyadb reconnect [host:5555]"; return 0 ;; esac
+  local hp="${1:-}"
+  if [ -z "$hp" ]; then
+    if [ -s "$TYADB_LAST_HOST_FILE" ]; then
+      hp="$(cat "$TYADB_LAST_HOST_FILE")"
+    else
+      err "reconnect failed: no saved host; run tyadb connect <host:5555>"
+      return 2
+    fi
+  fi
+  local host port serial
+  host="$(split_host "$hp")"
+  port="$(split_port "$hp")"
+  serial="$host:$port"
+  say "reconnecting $serial"
+  adb_run connect "$serial"
+  if ! verify_serial "$serial"; then
+    err "reconnect failed: transport did not verify: $serial"
+    return 1
+  fi
+  write_session "$host" "$port" "$serial" 1 "tcpip"
+  say "saved session: $serial"
+  adb_run devices -l
+}
+
+cmd_save_serial() {
+  local serial
+  serial="$(connected_serial || true)"
+  [ -n "$serial" ] || { err "save serial skipped: no connected device"; return 1; }
+  save_session_from_serial "$serial"
+}
+
+cmd_shell() {
+  case "${1:-}" in help|-h|--help) echo "usage: tyadb shell [args...]"; return 0 ;; esac
+  [ $# -gt 0 ] || { adb_run shell; return $?; }
+
+  if [ "$TYADB_REQUIRE_ALLOWLIST" = "1" ]; then
+    [ -f "$TYADB_ALLOWLIST_FILE" ] || {
+      err "command denied: allowlist missing at $TYADB_ALLOWLIST_FILE"
+      return 126
+    }
+    local first="$1"
+    if ! grep -Fxq "$first" "$TYADB_ALLOWLIST_FILE" && ! grep -Fxq "$*" "$TYADB_ALLOWLIST_FILE"; then
+      err "command denied: not in allowlist: $*"
+      return 126
+    fi
+  fi
+
+  adb_run shell "$@"
+}
+
+cmd_ping() {
+  local serial start end latency state protocol
+  serial="$(connected_serial || true)"
+  printf '[tyadb]\n'
+  printf 'Server: %s\n' "$([ "$(server_status)" = "OK" ] && printf 'running' || printf 'down')"
+
+  if [ -z "$serial" ]; then
+    printf 'Device: disconnected\n'
+    printf 'Serial: <none>\n'
+    printf 'Latency: <none>\n'
+    printf 'Transport: unknown\n'
+    return 1
+  fi
+
+  protocol="$(transport_for_serial "$serial")"
+  start="$(ms_now)"
+  if adb_run -s "$serial" shell 'echo tyadb-ping' 2>/dev/null | grep -q 'tyadb-ping'; then
+    end="$(ms_now)"
+    latency=$((end - start))
+    state="connected"
+    save_session_from_serial "$serial" >/dev/null 2>&1 || true
+  else
+    latency="<failed>"
+    state="disconnected"
+    clear_connected_session || true
+  fi
+
+  printf 'Device: %s\n' "$state"
+  printf 'Serial: %s\n' "$serial"
+  printf 'Latency: %s%s\n' "$latency" "$([ "$latency" = "<failed>" ] && printf '' || printf ' ms')"
+  printf 'Transport: %s\n' "$protocol"
+  [ "$state" = "connected" ]
+}
+
+cmd_info() {
+  local serial state battery android model host port
+  serial="$(connected_serial || true)"
+  if [ -z "$serial" ]; then
+    load_session
+    printf 'Host:    %s\n' "${TYADB_HOST:-<none>}${TYADB_PORT:+:$TYADB_PORT}"
+    printf 'Serial:  %s\n' "${TYADB_SERIAL:-<none>}"
+    printf 'State:   disconnected\n'
+    printf 'Battery: <unknown>\n'
+    printf 'Android: <unknown>\n'
+    printf 'Model:   <unknown>\n'
+    return 1
+  fi
+
+  state="$(adb_run -s "$serial" get-state 2>/dev/null || printf 'unknown')"
+  battery="$(adb_run -s "$serial" shell dumpsys battery 2>/dev/null | awk -F: '/level:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+  android="$(adb_run -s "$serial" shell getprop ro.build.version.release 2>/dev/null | tr -d '\r' | sed -n '1p')"
+  model="$(adb_run -s "$serial" shell getprop ro.product.model 2>/dev/null | tr -d '\r' | sed -n '1p')"
+
+  if [ "$(transport_for_serial "$serial")" = "tcpip" ]; then
+    host="$(split_host "$serial")"
+    port="$(split_port "$serial")"
+  else
+    host="<usb>"
+    port=""
+  fi
+
+  printf 'Host:    %s\n' "${host}${port:+:$port}"
+  printf 'Serial:  %s\n' "$serial"
+  printf 'State:   %s\n' "$state"
+  printf 'Battery: %s\n' "${battery:-<unknown>}${battery:+%}"
+  printf 'Android: %s\n' "${android:-<unknown>}"
+  printf 'Model:   %s\n' "${model:-<unknown>}"
+  save_session_from_serial "$serial" >/dev/null 2>&1 || true
+}
+
+tasker_installed() {
+  adb_run shell pm path net.dinglisch.android.taskerm >/dev/null 2>&1
+}
+
+cmd_tasker() {
+  local action="${1:-setup}" port="${2:-5555}" serial host current
+  case "$action" in
+    setup|heal)
+      serial="$(connected_serial || true)"
+      [ -n "$serial" ] || { err "tasker setup failed: no connected ADB transport; pair/connect wireless debugging first"; return 1; }
+      host="$(split_host "$serial")"
+      if ! tasker_installed; then
+        err "tasker package not found over ADB: net.dinglisch.android.taskerm"
+        err "continuing would not help Tasker; install/open Tasker first"
+        return 1
+      fi
+      say "Tasker found: net.dinglisch.android.taskerm"
+      say "switching adbd to tcpip $port from $serial"
+      adb_run -s "$serial" tcpip "$port"
+      sleep 2
+      current="$host:$port"
+      adb_run connect "$current"
+      if ! verify_serial "$current"; then
+        err "tasker setup failed: could not verify $current"
+        err "open Android Wireless debugging and re-pair if the port changed"
+        return 1
+      fi
+      write_session "$host" "$port" "$current" 1 "tcpip"
+      say "Tasker ADB WiFi target ready: $current"
+      say "In Tasker ADB Wifi preferences/use port: $port"
+      say "Run a Tasker ADB Wifi action like: test"
+      cmd_watch start >/dev/null 2>&1 || true
+      say "watcher started to keep ADB transport warm"
+      ;;
+    status)
+      printf '=== tyadb tasker status ===\n'
+      if tasker_installed; then printf 'Tasker: installed\n'; else printf 'Tasker: not found\n'; fi
+      load_session
+      printf 'Target: %s\n' "${TYADB_HOST:-<none>}${TYADB_PORT:+:$TYADB_PORT}"
+      printf 'Serial: %s\n' "${TYADB_SERIAL:-<none>}"
+      printf 'Connected: %s\n' "${TYADB_CONNECTED:-0}"
+      cmd_ping || true
+      ;;
+    watch)
+      cmd_watch start "${2:-$TYADB_WATCH_INTERVAL}"
+      ;;
+    stop-watch)
+      cmd_watch stop
+      ;;
+    help|-h|--help)
+      cat <<'EOF'
+usage: tyadb tasker [setup|heal|status|watch|stop-watch] [port]
+
+setup/heal:
+  Verifies Tasker package net.dinglisch.android.taskerm is installed,
+  switches the current verified ADB transport to tcpip port 5555 by default,
+  reconnects, verifies shell access, writes session.env, and starts tyadb watch.
+
+Important:
+  Android will still show its own ADB authorization dialog for Tasker.
+  Only allow it when you intentionally triggered Tasker ADB Wifi.
+EOF
+      ;;
+    *)
+      err "tasker failed: unknown command: $action"
+      return 2
+      ;;
+  esac
+}
+
+watch_once() {
+  local serial candidate host port last_state_file state prev_state
+  last_state_file="$TYADB_STATE_DIR/watch.last"
+  prev_state="$([ -s "$last_state_file" ] && cat "$last_state_file" || true)"
+
+  serial="$(connected_serial || true)"
+  if [ -n "$serial" ] && verify_serial "$serial" >/dev/null 2>&1; then
+    save_session_from_serial "$serial" >/dev/null 2>&1 || true
+    state="connected:$serial"
+    if [ "$state" != "$prev_state" ]; then
+      log_event "watch connected serial=$serial transport=$(transport_for_serial "$serial")"
+      printf '%s\n' "$state" > "$last_state_file"
+    fi
+    return 0
+  fi
+
+  state="disconnected"
+  if [ "$state" != "$prev_state" ]; then
+    log_event "watch disconnected"
+    printf '%s\n' "$state" > "$last_state_file"
+  fi
+  clear_connected_session >/dev/null 2>&1 || true
+
+  load_session
+  if [ -n "${TYADB_HOST:-}" ] && [ -n "${TYADB_PORT:-}" ]; then
+    candidate="$TYADB_HOST:$TYADB_PORT"
+  elif [ -s "$TYADB_LAST_HOST_FILE" ]; then
+    candidate="$(cat "$TYADB_LAST_HOST_FILE")"
+  else
+    candidate=""
+  fi
+
+  if [ -n "$candidate" ]; then
+    log_event "watch retry last_host=$candidate"
+    adb_run connect "$candidate" >/dev/null 2>&1 || true
+    if verify_serial "$candidate" >/dev/null 2>&1; then
+      host="$(split_host "$candidate")"
+      port="$(split_port "$candidate")"
+      write_session "$host" "$port" "$candidate" 1 "tcpip"
+      log_event "watch reconnected last_host=$candidate"
+      printf 'connected:%s\n' "$candidate" > "$last_state_file"
+      return 0
+    fi
+  fi
+
+  candidate="$(mdns_candidate || true)"
+  if [ -n "$candidate" ]; then
+    log_event "watch mdns candidate=$candidate"
+    adb_run connect "$candidate" >/dev/null 2>&1 || true
+    if verify_serial "$candidate" >/dev/null 2>&1; then
+      host="$(split_host "$candidate")"
+      port="$(split_port "$candidate")"
+      write_session "$host" "$port" "$candidate" 1 "tcpip"
+      log_event "watch reconnected mdns=$candidate"
+      printf 'connected:%s\n' "$candidate" > "$last_state_file"
+      return 0
+    fi
+    log_event "watch mdns verify failed candidate=$candidate"
+  fi
+
+  return 1
+}
+
+watch_run() {
+  local interval="${1:-$TYADB_WATCH_INTERVAL}"
+  log_event "watch run interval=${interval}s pid=$$"
+  say "watch running every ${interval}s; log: $TYADB_LOG_FILE"
+  while true; do
+    watch_once || true
+    sleep "$interval"
+  done
+}
+
+watch_start() {
+  local interval="${1:-$TYADB_WATCH_INTERVAL}"
+  if [ -s "$TYADB_WATCH_PID_FILE" ] && kill -0 "$(cat "$TYADB_WATCH_PID_FILE")" 2>/dev/null; then
+    say "watch already running pid=$(cat "$TYADB_WATCH_PID_FILE")"
+    return 0
+  fi
+  local self
+  self="$(command -v tyadb || printf '%s' "$0")"
+  have termux-wake-lock && termux-wake-lock >/dev/null 2>&1 || true
+  if have setsid; then
+    setsid "$self" watch run "$interval" >> "$TYADB_LOG_FILE" 2>&1 &
+  else
+    nohup "$self" watch run "$interval" >> "$TYADB_LOG_FILE" 2>&1 &
+  fi
+  printf '%s\n' "$!" > "$TYADB_WATCH_PID_FILE"
+  sleep 1
+  if kill -0 "$(cat "$TYADB_WATCH_PID_FILE")" 2>/dev/null; then
+    say "watch started pid=$(cat "$TYADB_WATCH_PID_FILE") interval=${interval}s"
+    say "log: $TYADB_LOG_FILE"
+  else
+    err "watch failed to start; see $TYADB_LOG_FILE"
+    return 1
+  fi
+}
+
+watch_stop() {
+  if [ -s "$TYADB_WATCH_PID_FILE" ]; then
+    local pid
+    pid="$(cat "$TYADB_WATCH_PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      log_event "watch stopped pid=$pid"
+      say "watch stopped pid=$pid"
+    else
+      say "watch pid stale: $pid"
+    fi
+    rm -f "$TYADB_WATCH_PID_FILE"
+    have termux-wake-unlock && termux-wake-unlock >/dev/null 2>&1 || true
+  else
+    say "watch not running"
+  fi
+}
+
+watch_status() {
+  if [ -s "$TYADB_WATCH_PID_FILE" ] && kill -0 "$(cat "$TYADB_WATCH_PID_FILE")" 2>/dev/null; then
+    printf 'Watch: running\n'
+    printf 'PID:   %s\n' "$(cat "$TYADB_WATCH_PID_FILE")"
+  else
+    printf 'Watch: stopped\n'
+  fi
+  printf 'Log:   %s\n' "$TYADB_LOG_FILE"
+  [ -f "$TYADB_LOG_FILE" ] && tail -n 5 "$TYADB_LOG_FILE" || true
+}
+
+cmd_watch() {
+  case "${1:-start}" in
+    start) shift || true; watch_start "${1:-$TYADB_WATCH_INTERVAL}" ;;
+    run|foreground) shift || true; watch_run "${1:-$TYADB_WATCH_INTERVAL}" ;;
+    once) watch_once ;;
+    stop) watch_stop ;;
+    restart)
+      watch_stop
+      shift || true
+      watch_start "${1:-$TYADB_WATCH_INTERVAL}"
+      ;;
+    status) watch_status ;;
+    help|-h|--help)
+      echo "usage: tyadb watch [start [interval]|run [interval]|once|stop|restart [interval]|status]"
+      ;;
+    *)
+      if printf '%s' "$1" | grep -Eq '^[0-9]+$'; then
+        watch_start "$1"
+      else
+        err "watch failed: unknown command: $1"
+        return 2
+      fi
+      ;;
+  esac
+}
+
+cmd_auto() {
+  case "${1:-}" in help|-h|--help) echo "usage: tyadb auto <host> [from_port] [tcpip_port]"; return 0 ;; esac
+  local host="${1:-}" start_port="${2:-40459}" tcpip_port="${3:-5555}"
+  [ -n "$host" ] || { err "auto failed: usage: tyadb auto <host> [pair_or_start_port=40459] [tcpip=5555]"; return 2; }
+  host="$(split_host "$host")"
+  local old_transport="$host:$start_port" new_transport="$host:$tcpip_port"
+
+  say "connect $old_transport"
+  adb_run connect "$old_transport" || true
+  sleep 1
+
+  say "switch tcpip $tcpip_port"
+  if ! adb_run -s "$old_transport" tcpip "$tcpip_port"; then
+    err "auto failed: could not switch $old_transport to tcpip $tcpip_port"
+    return 1
+  fi
+  sleep 1
+
+  say "disconnect old transport $old_transport"
+  adb_run disconnect "$old_transport" >/dev/null 2>&1 || true
+
+  say "connect $new_transport"
+  adb_run connect "$new_transport"
+  if verify_serial "$new_transport"; then
+    write_session "$host" "$tcpip_port" "$new_transport" 1 "tcpip"
+    say "auto complete: $new_transport"
+    adb_run devices -l
+    return 0
+  fi
+
+  err "auto verify failed: rolling back to $old_transport"
+  adb_run disconnect "$new_transport" >/dev/null 2>&1 || true
+  adb_run connect "$old_transport" || true
+  return 1
+}
+
+cmd_panel() {
+  if have fzf; then
+    local pick
+    pick="$(printf '%s\n' "Ping" "Info" "Watch status" "Watch start" "Watch stop" "Status" "Doctor" "Devices" "Connect" "TCPIP 5555" "Shell" "Pair" "mDNS" "Auto connect chain" "Restart server" "Reconnect last" | fzf --height=45%)" || return 0
+    case "$pick" in
+      Ping) cmd_ping ;;
+      Info) cmd_info ;;
+      "Watch status") cmd_watch status ;;
+      "Watch start") cmd_watch start ;;
+      "Watch stop") cmd_watch stop ;;
+      Status) cmd_status ;;
+      Doctor) cmd_doctor ;;
+      Devices) adb_run devices -l ;;
+      Connect) printf "host[:port]: "; read -r hp; cmd_connect "$hp" ;;
+      "TCPIP 5555") adb_run tcpip 5555 ;;
+      Shell) cmd_shell ;;
+      Pair) printf "host:pair_port code: "; read -r hp code; cmd_pair "$hp" "$code" ;;
+      mDNS) adb_run mdns services ;;
+      "Auto connect chain") printf "host: "; read -r h; cmd_auto "$h" ;;
+      "Restart server") cmd_restart ;;
+      "Reconnect last") cmd_reconnect ;;
+    esac
+  else
+    echo "p) Ping  i) Info  w) Watch status  W) Watch start  x) Watch stop  1) Status  2) Doctor  3) Devices  4) Connect  5) TCPIP  6) Shell  7) Pair  8) mDNS  9) Auto  r) Restart  c) Reconnect  0) Exit"
+    printf "Select: "; read -r n
+    case "$n" in
+      p) cmd_ping ;;
+      i) cmd_info ;;
+      w) cmd_watch status ;;
+      W) cmd_watch start ;;
+      x) cmd_watch stop ;;
+      1) cmd_status ;;
+      2) cmd_doctor ;;
+      3) adb_run devices -l ;;
+      4) printf "host[:port]: "; read -r hp; cmd_connect "$hp" ;;
+      5) adb_run tcpip 5555 ;;
+      6) cmd_shell ;;
+      7) printf "host:pair_port code: "; read -r hp code; cmd_pair "$hp" "$code" ;;
+      8) adb_run mdns services ;;
+      9) printf "host: "; read -r h; cmd_auto "$h" ;;
+      r) cmd_restart ;;
+      c) cmd_reconnect ;;
+    esac
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+usage: tyadb <command> [args]
+
+Lifecycle:
+  start                 Start adb server
+  stop                  Stop adb server
+  restart               Restart adb server
+  status                Show Tydroid adb status
+  doctor                Diagnose adb, storage, saved host, services
+  ping                  Fast health check and shell latency
+  info                  Script-friendly device summary
+  watch                 Start background ADB session watcher
+  watch status          Show watcher PID and recent transitions
+  watch run [interval]  Run watcher in foreground
+  watch stop            Stop background watcher
+  tasker setup [port]   Prepare stable ADB WiFi port for Tasker
+  tasker status         Show Tasker/ADB readiness
+
+Device/session:
+  pair <host:port> <code>
+  connect [host:5555]
+  reconnect [host:5555]
+  save-serial
+  devices
+  mdns
+  tcpip [port]
+  shell [args...]
+  auto <host> [from_port] [tcpip_port]
+  panel
+
+Machine-readable:
+  session.env           ~/.local/state/tydroid/adb/session.env
+
+Raw adb:
+  Any unknown command is passed through to adb.
+
+Optional guard:
+  TYADB_REQUIRE_ALLOWLIST=1 tyadb shell <cmd>
+  allowlist file: ~/.config/tydroid/adb/allowed-shell.txt
+EOF
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+  start|start-server) cmd_start "$@" ;;
+  stop|kill-server) cmd_stop "$@" ;;
+  restart) cmd_restart "$@" ;;
+  status) cmd_status "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  ping) cmd_ping "$@" ;;
+  info) cmd_info "$@" ;;
+  watch) cmd_watch "$@" ;;
+  tasker) cmd_tasker "$@" ;;
+  pair) cmd_pair "$@" ;;
+  connect) cmd_connect "$@" ;;
+  reconnect) cmd_reconnect "$@" ;;
+  save-serial) cmd_save_serial "$@" ;;
+  devices) adb_run devices -l "$@" ;;
+  mdns) adb_run mdns check 2>/dev/null || true; adb_run mdns services "$@" ;;
+  tcpip) adb_run tcpip "${1:-5555}" ;;
+  shell) cmd_shell "$@" ;;
+  auto) cmd_auto "$@" ;;
+  panel|menu) cmd_panel "$@" ;;
+  help|-h|--help) usage ;;
+  *) adb_run "$cmd" "$@" ;;
+esac

@@ -1,0 +1,8 @@
+# Local/runtime files are not part of the portable bundle.
+*.log
+*.pid
+*.env
+session.env
+node_modules/
+__pycache__/
+*.tar.gz

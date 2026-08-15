@@ -1,0 +1,232 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -u
+
+ADB="${TYADB_ADB_BIN:-$(command -v adb 2>/dev/null || true)}"
+TYADB_BIN="${TYADB_BIN:-$(command -v tyadb 2>/dev/null || true)}"
+STATE_DIR="${TYADB_STATE_DIR:-$HOME/.local/state/tydroid/adb}"
+LOG="$STATE_DIR/boot.log"
+LOCK="$STATE_DIR/boot.lock"
+TARGET_PORT="${TYADB_BOOT_PORT:-5555}"
+CONNECT_TIMEOUT="${TYADB_BOOT_CONNECT_TIMEOUT:-3}"
+SCAN_RADIUS="${TYADB_BOOT_SCAN_RADIUS:-25}"
+CANDIDATES=""
+uniq_candidates=""
+
+mkdir -p "$STATE_DIR"
+
+log() {
+  printf '%s [tyadb-boot] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+}
+
+say() {
+  printf '[tyadb-boot] %s\n' "$*"
+  log "$*"
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+adb_run() {
+  [ -n "$ADB" ] || return 127
+  "$ADB" "$@"
+}
+
+wifi_ip() {
+  local json ip
+  if have termux-wifi-connectioninfo; then
+    json="$(termux-wifi-connectioninfo 2>/dev/null || true)"
+    ip="$(printf '%s\n' "$json" | sed -n 's/.*"ip"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
+    [ -n "$ip" ] && [ "$ip" != "0.0.0.0" ] && { printf '%s\n' "$ip"; return 0; }
+  fi
+  ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
+}
+
+split_host() {
+  printf '%s' "${1%:*}"
+}
+
+split_port() {
+  if [ "$1" != "${1%:*}" ]; then
+    printf '%s' "${1##*:}"
+  else
+    printf '%s' "$TARGET_PORT"
+  fi
+}
+
+numeric_port() {
+  printf '%s' "$1" | grep -Eq '^[0-9]{2,5}$' && [ "$1" -gt 0 ] && [ "$1" -le 65535 ]
+}
+
+append_candidate() {
+  local hp="$1"
+  [ -n "$hp" ] || return 0
+  printf '%s\n' "$hp" | grep -Eq '^[^:]+:[0-9]+$' || return 0
+  printf '%s\n' "$hp" >> "$CANDIDATES"
+}
+
+append_saved_host_file() {
+  local file="$1" ip="$2" hp host port
+  [ -s "$file" ] || return 0
+  hp="$(sed -n '1p' "$file" 2>/dev/null | tr -d '\r')"
+  [ -n "$hp" ] || return 0
+  append_candidate "$hp"
+  host="$(split_host "$hp")"
+  port="$(split_port "$hp")"
+  if [ -n "$ip" ] && [ "$host" != "$ip" ]; then
+    append_candidate "$ip:$port"
+  fi
+}
+
+append_session_file() {
+  local file="$1" ip="$2" host port serial
+  [ -s "$file" ] || return 0
+  host="$(sed -n "s/^TYADB_HOST='\\{0,1\\}\\([^']*\\)'\\{0,1\\}$/\\1/p" "$file" 2>/dev/null | sed -n '1p')"
+  port="$(sed -n "s/^TYADB_PORT='\\{0,1\\}\\([^']*\\)'\\{0,1\\}$/\\1/p" "$file" 2>/dev/null | sed -n '1p')"
+  serial="$(sed -n "s/^TYADB_SERIAL='\\{0,1\\}\\([^']*\\)'\\{0,1\\}$/\\1/p" "$file" 2>/dev/null | sed -n '1p')"
+  [ -n "$serial" ] && append_candidate "$serial"
+  if [ -n "$host" ] && numeric_port "$port"; then
+    append_candidate "$host:$port"
+    [ -n "$ip" ] && [ "$host" != "$ip" ] && append_candidate "$ip:$port"
+  fi
+}
+
+verify_serial() {
+  local serial="$1"
+  adb_run -s "$serial" get-state >/dev/null 2>&1 || return 1
+  adb_run -s "$serial" shell 'echo tyadb-boot-ok' 2>/dev/null | grep -q 'tyadb-boot-ok'
+}
+
+connect_verify() {
+  local hp="$1"
+  say "trying $hp"
+  timeout "$CONNECT_TIMEOUT" "$ADB" connect "$hp" >/dev/null 2>&1 || true
+  verify_serial "$hp"
+}
+
+port_open() {
+  local host="$1" port="$2"
+  timeout 1 nc -z -w 1 "$host" "$port" >/dev/null 2>&1
+}
+
+try_enable_wireless_flag() {
+  if have shizuku && shizuku status 2>/dev/null | grep -qi 'Server:.*Running'; then
+    shizuku exec 'settings put global adb_wifi_enabled 1' >/dev/null 2>&1 || true
+    log "asked Shizuku to enable adb_wifi_enabled"
+  fi
+}
+
+promote_to_target() {
+  local serial="$1" ip="$2" port target
+  port="$(split_port "$serial")"
+  target="$ip:$TARGET_PORT"
+
+  if [ "$port" = "$TARGET_PORT" ]; then
+    return 0
+  fi
+
+  say "promoting $serial to tcpip $TARGET_PORT"
+  adb_run -s "$serial" tcpip "$TARGET_PORT" >> "$LOG" 2>&1 || return 1
+  sleep 2
+  adb_run disconnect "$serial" >/dev/null 2>&1 || true
+  timeout "$CONNECT_TIMEOUT" "$ADB" connect "$target" >> "$LOG" 2>&1 || true
+  verify_serial "$target"
+}
+
+save_success() {
+  local target="$1"
+  adb_run -s "$target" shell 'settings put global adb_wifi_enabled 1 >/dev/null 2>&1; settings put global adb_allowed_connection_time 0 >/dev/null 2>&1; true' >/dev/null 2>&1 || true
+  if [ -n "$TYADB_BIN" ]; then
+    "$TYADB_BIN" connect "$target" >> "$LOG" 2>&1 || true
+    "$TYADB_BIN" watch start 15 >> "$LOG" 2>&1 || true
+  fi
+  printf '%s\n' "$target" > "$STATE_DIR/last_host"
+  say "ready: $target"
+}
+
+main() {
+  [ -n "$ADB" ] || { say "adb not found"; return 127; }
+
+  if [ -e "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+    say "already running pid=$(cat "$LOCK")"
+    return 0
+  fi
+  printf '%s\n' "$$" > "$LOCK"
+  trap 'rm -f "$LOCK"' EXIT INT TERM
+
+  have termux-wake-lock && termux-wake-lock >/dev/null 2>&1 || true
+  try_enable_wireless_flag
+  adb_run start-server >> "$LOG" 2>&1 || true
+
+  local ip tcp_port tls_port target hp port host
+  ip="$(wifi_ip || true)"
+  [ -n "$ip" ] || { say "no Wi-Fi IP found"; return 1; }
+  say "wifi ip: $ip"
+
+  CANDIDATES="$(mktemp "$STATE_DIR/boot-candidates.XXXXXX")"
+  uniq_candidates="$(mktemp "$STATE_DIR/boot-candidates-uniq.XXXXXX")"
+  trap 'rm -f "$LOCK" "$CANDIDATES" "$uniq_candidates"' EXIT INT TERM
+
+  tcp_port="$(getprop service.adb.tcp.port 2>/dev/null | tr -d '\r' || true)"
+  tls_port="$(getprop service.adb.tls.port 2>/dev/null | tr -d '\r' || true)"
+
+  numeric_port "$tcp_port" && append_candidate "$ip:$tcp_port"
+  append_candidate "$ip:$TARGET_PORT"
+  numeric_port "$tls_port" && append_candidate "$ip:$tls_port"
+  append_saved_host_file "$STATE_DIR/last_host" "$ip"
+  append_session_file "$STATE_DIR/session.env" "$ip"
+  append_saved_host_file "$HOME/.config/tyadb/last_host" "$ip"
+
+  if [ -n "${TYADB_BOOT_PORTS:-}" ]; then
+    for port in $TYADB_BOOT_PORTS; do
+      numeric_port "$port" && append_candidate "$ip:$port"
+    done
+  fi
+
+  awk '!seen[$0]++' "$CANDIDATES" > "$uniq_candidates"
+
+  while IFS= read -r hp; do
+    [ -n "$hp" ] || continue
+    if connect_verify "$hp"; then
+      target="$ip:$TARGET_PORT"
+      if promote_to_target "$hp" "$ip"; then
+        save_success "$target"
+        return 0
+      fi
+      save_success "$hp"
+      return 0
+    fi
+  done < "$uniq_candidates"
+
+  say "saved candidates failed; scanning around remembered ports"
+  while IFS= read -r hp; do
+    host="$(split_host "$hp")"
+    port="$(split_port "$hp")"
+    numeric_port "$port" || continue
+    [ "$host" = "$ip" ] || host="$ip"
+    local start end p
+    start=$((port - SCAN_RADIUS))
+    end=$((port + SCAN_RADIUS))
+    [ "$start" -lt 1 ] && start=1
+    [ "$end" -gt 65535 ] && end=65535
+    p="$start"
+    while [ "$p" -le "$end" ]; do
+      if port_open "$host" "$p" && connect_verify "$host:$p"; then
+        target="$ip:$TARGET_PORT"
+        if promote_to_target "$host:$p" "$ip"; then
+          save_success "$target"
+        else
+          save_success "$host:$p"
+        fi
+        return 0
+      fi
+      p=$((p + 1))
+    done
+  done < "$uniq_candidates"
+
+  say "failed: no verified ADB Wi-Fi transport found"
+  say "open Wireless debugging once, pair if needed, then run: tyadb-boot"
+  return 1
+}
+
+main "$@"

@@ -1,0 +1,26 @@
+#!/data/data/com.termux/files/usr/bin/sh
+case "${1:-status}" in
+  prompt)
+    if tyadb devices 2>/dev/null | awk '/\tdevice$/ {found=1} END {exit found ? 0 : 1}'; then
+      printf 'A'
+    else
+      printf '-'
+    fi
+    ;;
+  monitor)
+    interval="${2:-30}"
+    while true; do
+      tyadb status
+      sleep "$interval"
+    done
+    ;;
+  single|status|"")
+    exec tyadb status
+    ;;
+  help|-h|--help)
+    echo "Usage: tyadb-status {status|single|monitor [interval]|prompt|help}"
+    ;;
+  *)
+    exec tyadb status "$@"
+    ;;
+esac
